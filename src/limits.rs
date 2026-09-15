@@ -202,6 +202,45 @@ impl Limits {
     }
 }
 
+/// A fixed token bucket per peer, for announcements: gossipsub delivers what any peer publishes,
+/// and without this one node could make every other node report a stream of them.
+pub struct SourceRate {
+    per_second: f64,
+    burst: f64,
+    buckets: HashMap<PeerId, Bucket>,
+}
+
+impl SourceRate {
+    pub fn new(interval: Duration, burst: u32) -> Self {
+        SourceRate {
+            per_second: 1.0 / interval.as_secs_f64(),
+            burst: burst as f64,
+            buckets: HashMap::new(),
+        }
+    }
+
+    pub fn allow(&mut self, peer: PeerId, now: Instant) -> bool {
+        if self.buckets.len() > MAX_BUCKETS {
+            let (per_second, burst) = (self.per_second, self.burst);
+            self.buckets.retain(|_, b| {
+                b.tokens + now.saturating_duration_since(b.updated).as_secs_f64() * per_second < burst
+            });
+        }
+        let bucket = self.buckets.entry(peer).or_insert(Bucket {
+            tokens: self.burst,
+            updated: now,
+        });
+        let elapsed = now.saturating_duration_since(bucket.updated).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * self.per_second).min(self.burst);
+        bucket.updated = now;
+        if bucket.tokens < 1.0 {
+            return false;
+        }
+        bucket.tokens -= 1.0;
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,6 +375,17 @@ mod tests {
             assert_eq!(limits.check(&request(peer, None, 0), now), Ok(()));
         }
         assert!(limits.check(&request(peer, None, 0), now).is_err());
+    }
+
+    #[test]
+    fn announcements_are_limited_per_source() {
+        let mut rate = SourceRate::new(Duration::from_secs(10), 3);
+        let (a, b) = (PeerId::random(), PeerId::random());
+        let now = Instant::now();
+        assert!((0..3).all(|_| rate.allow(a, now)));
+        assert!(!rate.allow(a, now));
+        assert!(rate.allow(b, now));
+        assert!(rate.allow(a, now + Duration::from_secs(10)));
     }
 
     #[test]

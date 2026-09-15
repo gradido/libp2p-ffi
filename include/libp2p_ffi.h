@@ -77,11 +77,13 @@ typedef struct lp2p_relay_options {
     lp2p_rate circuits_per_ip;
 } lp2p_relay_options;
 
-/* Frozen. The announcement: a signed gossipsub message when the node starts and whenever its
- * payload changes. No heartbeat. */
+/* Frozen. The announcement: a gossipsub message the node signs, published when the caller sets a
+ * payload that differs from the last one -- no heartbeat. Receivers check the delegation inside
+ * before they report or forward it, drop it for a blocked group, and pass on at most three per
+ * node in reserve and one every ten seconds after that. */
 typedef struct lp2p_announce_options {
-    uint8_t enabled;
-    const char *topic;
+    uint8_t enabled;   /* on by default */
+    const char *topic; /* NULL: "<dht_protocol>/announce" */
     uint32_t max_payload_bytes;
 } lp2p_announce_options;
 
@@ -135,25 +137,25 @@ typedef struct lp2p_options {
 
 /* Events. One record per event, whole records only, each followed by its data. */
 #define LP2P_EV_LISTENING 1 /* data: the multiaddr, UTF-8 */
-#define LP2P_EV_REACHABILITY                                                                       \
-    2 /* reason: LP2P_REACH_*. Once at start with the configured value;
-                                       again whenever AutoNAT changes it, once AutoNAT is in */
-#define LP2P_EV_PEER_CONNECTED                                                                     \
-    3                               /* node; data: the address of the first connection, UTF-8 --
-                                       it contains /p2p-circuit when that connection is relayed */
+/* reason: LP2P_REACH_*. Once at start with the configured value; again whenever AutoNAT changes
+ * it, once AutoNAT is in. */
+#define LP2P_EV_REACHABILITY 2
+/* node; data: the address of the first connection, UTF-8 -- it contains /p2p-circuit when that
+ * connection is relayed. */
+#define LP2P_EV_PEER_CONNECTED 3
 #define LP2P_EV_PEER_DISCONNECTED 4 /* node */
-#define LP2P_EV_RPC_REQUEST                                                                        \
-    5                             /* id, group and node (delegation checked), protocol,
-                                       data: payload. Answer with respond or reject. */
-#define LP2P_EV_RPC_RESPONSE 6    /* id, group, node that answered, protocol; data: payload */
-#define LP2P_EV_RPC_FAILED 7      /* id, group, protocol, reason: LP2P_FAIL_* */
-#define LP2P_EV_ANNOUNCEMENT 8    /* group, node; data: payload. New or not is the caller's call */
+/* id, group and node (delegation checked), protocol; data: payload. Answer with respond or
+ * reject. */
+#define LP2P_EV_RPC_REQUEST 5
+#define LP2P_EV_RPC_RESPONSE 6 /* id, group, node that answered, protocol; data: payload */
+#define LP2P_EV_RPC_FAILED 7   /* id, group, protocol, reason: LP2P_FAIL_* */
+/* group, node (delegation checked); data: payload. Whether the group is new is the caller's call. */
+#define LP2P_EV_ANNOUNCEMENT 8
 #define LP2P_EV_PEER_DISCOVERED 9 /* id of the walk, node; data: multiaddrs, NUL-separated */
 #define LP2P_EV_DHT_RESULT 10     /* id; flags: LP2P_EVF_LAST ends the query */
-#define LP2P_EV_LIMITED                                                                            \
-    11                      /* group, node, protocol, reason: the LP2P_SCOPE_* that refused
-                                     a request, or LP2P_LIMITED_BLOCKED. At most ten per second;
-                                     lp2p_stats.rpc_limited counts all of them */
+/* group, node, protocol, reason: the LP2P_SCOPE_* that refused a request, or
+ * LP2P_LIMITED_BLOCKED. At most ten per second; lp2p_stats.rpc_limited counts all of them. */
+#define LP2P_EV_LIMITED 11
 #define LP2P_EV_OVERFLOW 12 /* id: how many events were dropped */
 
 #define LP2P_EVF_LAST 1u
@@ -265,7 +267,13 @@ int32_t lp2p_peer_set_class(lp2p *node, const lp2p_key group, uint8_t peer_class
 int32_t lp2p_limit_set(lp2p *node, uint8_t peer_class, uint8_t scope, uint16_t protocol,
                        lp2p_rate rate);
 
-/** Not implemented in this release: answers LP2P_ERR_UNAVAILABLE. */
+/**
+ * Sets what this node announces, and announces it when it differs from what was announced last.
+ * Without a subscribed peer the announcement waits and goes out as soon as one appears. A node
+ * announces nothing until the caller sets a payload, typically right after lp2p_start.
+ * LP2P_ERR_UNAVAILABLE when announcements are off; LP2P_ERR_INVALID_ARGUMENT above
+ * announce.max_payload_bytes.
+ */
 int32_t lp2p_announce_set_payload(lp2p *node, const uint8_t *data, size_t len);
 
 /** The network. */

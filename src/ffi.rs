@@ -14,7 +14,7 @@ use libp2p::{Multiaddr, StreamProtocol};
 use crate::abi::*;
 use crate::delegation::{Delegation, now_ms};
 use crate::keys;
-use crate::node::{Command, Config, Node, Reachability, RelayConfig, TokenBucket};
+use crate::node::{AnnounceConfig, Command, Config, Node, Reachability, RelayConfig, TokenBucket};
 
 /// The handle C holds.
 #[allow(non_camel_case_types)]
@@ -124,6 +124,23 @@ unsafe fn config_from(o: &lp2p_options) -> Result<Config, i32> {
     let dht_protocol = StreamProtocol::try_from_owned(unsafe { string(o.dht_protocol)? })
         .map_err(|_| LP2P_ERR_INVALID_ARGUMENT)?;
     let rpc_protocols = unsafe { strings(o.rpc_protocols, o.rpc_protocol_count)? };
+    let announce = if o.announce.enabled != 0 {
+        let topic = if o.announce.topic.is_null() {
+            // Derived from the DHT protocol, so two networks never share an announcement topic.
+            format!("{}/announce", dht_protocol.as_ref())
+        } else {
+            unsafe { string(o.announce.topic)? }
+        };
+        if topic.is_empty() {
+            return Err(LP2P_ERR_INVALID_ARGUMENT);
+        }
+        Some(AnnounceConfig {
+            topic,
+            max_payload_bytes: o.announce.max_payload_bytes as usize,
+        })
+    } else {
+        None
+    };
     if rpc_protocols.len() > u16::MAX as usize || rpc_protocols.iter().any(|p| p.is_empty() || p.len() > 255)
     {
         return Err(LP2P_ERR_INVALID_ARGUMENT);
@@ -164,6 +181,7 @@ unsafe fn config_from(o: &lp2p_options) -> Result<Config, i32> {
         max_connections: limit(o.max_connections),
         max_connections_per_peer: limit(o.max_connections_per_peer),
         max_pending_incoming: limit(o.max_pending_incoming),
+        announce,
         // Below one megabyte-sized response a queue would drop the first large event it meets.
         event_queue_bytes: o.event_queue_bytes.max(o.rpc_max_response_bytes as usize + 4096),
     })
@@ -386,10 +404,15 @@ pub unsafe extern "C" fn lp2p_limit_set(
 pub unsafe extern "C" fn lp2p_announce_set_payload(node: *mut lp2p, data: *const u8, len: usize) -> i32 {
     guard(|| {
         status((|| {
-            unsafe { handle(node)? };
-            unsafe { bytes(data, len)? };
-            // The announcement arrives with gossipsub.
-            Ok(LP2P_ERR_UNAVAILABLE)
+            let node = unsafe { handle(node)? };
+            let payload = unsafe { bytes(data, len)? }.to_vec();
+            let Some(max) = node.announce_max_payload_bytes else {
+                return Ok(LP2P_ERR_UNAVAILABLE);
+            };
+            if payload.len() > max {
+                return Err(LP2P_ERR_INVALID_ARGUMENT);
+            }
+            Ok(node.send(Command::AnnounceSetPayload { payload }))
         })())
     })
 }

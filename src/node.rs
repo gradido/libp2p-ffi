@@ -20,8 +20,8 @@ use libp2p::request_response::{self, InboundRequestId, OutboundRequestId, Protoc
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::{ConnectionId, NetworkBehaviour, SwarmEvent};
 use libp2p::{
-    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, connection_limits, dcutr, identify, noise, relay,
-    tcp, yamux,
+    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, connection_limits, dcutr, gossipsub, identify,
+    noise, relay, tcp, yamux,
 };
 use tokio::sync::mpsc;
 
@@ -30,7 +30,7 @@ use crate::address_book::AddressBook;
 use crate::delegation::{Delegation, now_ms};
 use crate::events::{EventBuilder, EventQueue, Record};
 use crate::keys;
-use crate::limits::{self, Limits};
+use crate::limits::{self, Limits, SourceRate};
 use crate::wire::{self, RPC_PROTOCOL, RawCodec};
 
 /// How long a provider record is re-published at most once. A burst of new peers after start
@@ -48,6 +48,18 @@ const MAX_RESERVATIONS: usize = 2;
 /// How long a relay that refused or dropped a reservation is left alone.
 const RELAY_RETRY: Duration = Duration::from_secs(60);
 const MAX_RELAY_CANDIDATES: usize = 64;
+/// Announcements per source: one every ten seconds, three in reserve.
+const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(10);
+const ANNOUNCE_BURST: u32 = 3;
+/// What a gossipsub message adds around an announcement frame: protobuf fields, the source, its
+/// sequence number, the topic and the signature with the node's public key.
+const GOSSIPSUB_OVERHEAD: usize = 1024;
+
+#[derive(Clone, Debug)]
+pub struct AnnounceConfig {
+    pub topic: String,
+    pub max_payload_bytes: usize,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reachability {
@@ -93,6 +105,7 @@ pub struct Config {
     pub max_connections: Option<u32>,
     pub max_connections_per_peer: Option<u32>,
     pub max_pending_incoming: Option<u32>,
+    pub announce: Option<AnnounceConfig>,
     pub event_queue_bytes: usize,
 }
 
@@ -126,6 +139,9 @@ pub enum Command {
         group: lp2p_key,
         class: u8,
     },
+    AnnounceSetPayload {
+        payload: Vec<u8>,
+    },
     SetLimit {
         class: u8,
         scope: u8,
@@ -158,6 +174,8 @@ pub struct Node {
     pub rpc_protocol_count: usize,
     pub rpc_max_request_bytes: u32,
     pub rpc_timeout: Duration,
+    /// The payload bound, or None when announcements are off.
+    pub announce_max_payload_bytes: Option<usize>,
 }
 
 impl Node {
@@ -184,6 +202,7 @@ impl Node {
         let rpc_protocol_count = config.rpc_protocols.len();
         let rpc_max_request_bytes = config.rpc_max_request_bytes;
         let rpc_timeout = config.rpc_timeout;
+        let announce_max_payload_bytes = config.announce.as_ref().map(|a| a.max_payload_bytes);
 
         let (commands, receiver) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -201,6 +220,7 @@ impl Node {
                 rpc_protocol_count,
                 rpc_max_request_bytes,
                 rpc_timeout,
+                announce_max_payload_bytes,
             }),
             Ok(status) => {
                 let _ = thread.join();
@@ -311,6 +331,24 @@ struct Behaviour {
     relay_client: relay::client::Behaviour,
     relay_server: Toggle<relay::Behaviour>,
     dcutr: Toggle<dcutr::Behaviour>,
+    gossipsub: Toggle<gossipsub::Behaviour>,
+}
+
+type BuildError = Box<dyn std::error::Error + Send + Sync>;
+
+fn make_gossipsub(announce: &AnnounceConfig, key: &Keypair) -> Result<gossipsub::Behaviour, BuildError> {
+    let config = gossipsub::ConfigBuilder::default()
+        // Every message is signed by the node that published it, and nothing unsigned is taken.
+        .validation_mode(gossipsub::ValidationMode::Strict)
+        // Held back until the delegation inside has been checked: an invalid announcement is
+        // neither reported nor forwarded.
+        .validate_messages()
+        .max_transmit_size(1 + LP2P_DELEGATION_BYTES + announce.max_payload_bytes + GOSSIPSUB_OVERHEAD)
+        .build()?;
+    let mut behaviour =
+        gossipsub::Behaviour::new(gossipsub::MessageAuthenticity::Signed(key.clone()), config)?;
+    behaviour.subscribe(&gossipsub::IdentTopic::new(announce.topic.clone()))?;
+    Ok(behaviour)
 }
 
 fn relay_server_config(r: &RelayConfig) -> relay::Config {
@@ -335,7 +373,11 @@ fn relay_server_config(r: &RelayConfig) -> relay::Config {
     config
 }
 
-fn make_behaviour(config: &Config, key: &Keypair, relay_client: relay::client::Behaviour) -> Behaviour {
+fn make_behaviour(
+    config: &Config,
+    key: &Keypair,
+    relay_client: relay::client::Behaviour,
+) -> Result<Behaviour, BuildError> {
     let peer = key.public().to_peer_id();
     let private = config.reachability == Reachability::Private;
     let limits = connection_limits::Behaviour::new(
@@ -370,7 +412,11 @@ fn make_behaviour(config: &Config, key: &Keypair, relay_client: relay::client::B
     let relay_server = (config.relay.server && !private)
         .then(|| relay::Behaviour::new(peer, relay_server_config(&config.relay)));
     let dcutr = config.dcutr.then(|| dcutr::Behaviour::new(peer));
-    Behaviour {
+    let gossipsub = match &config.announce {
+        Some(announce) => Some(make_gossipsub(announce, key)?),
+        None => None,
+    };
+    Ok(Behaviour {
         limits,
         address_book: AddressBook::default(),
         kad,
@@ -379,7 +425,8 @@ fn make_behaviour(config: &Config, key: &Keypair, relay_client: relay::client::B
         relay_client,
         relay_server: relay_server.into(),
         dcutr: dcutr.into(),
-    }
+        gossipsub: gossipsub.into(),
+    })
 }
 
 fn build_swarm(config: &Config, keypair: Keypair) -> Result<Swarm<Behaviour>, i32> {
@@ -466,6 +513,12 @@ struct State {
     connections: HashMap<ConnectionId, Multiaddr>,
     limits: Limits,
     last_sweep: Instant,
+    announce_topic: Option<gossipsub::IdentTopic>,
+    /// The payload the caller set, and the one last published; they differ while a publication
+    /// is pending.
+    announce_payload: Option<Vec<u8>>,
+    announce_published: Option<Vec<u8>>,
+    announce_rate: SourceRate,
 }
 
 /// Queues @p peer for @p call: the group's last good node first, recently failed nodes last, the
@@ -554,6 +607,13 @@ impl State {
             connections: HashMap::new(),
             limits: Limits::default(),
             last_sweep: Instant::now(),
+            announce_topic: config
+                .announce
+                .as_ref()
+                .map(|a| gossipsub::IdentTopic::new(a.topic.clone())),
+            announce_payload: None,
+            announce_published: None,
+            announce_rate: SourceRate::new(ANNOUNCE_INTERVAL, ANNOUNCE_BURST),
         }
     }
 
@@ -667,6 +727,10 @@ impl State {
                 let _ = reply.send(self.routing_sample(swarm, max));
             }
             Command::SetClass { group, class } => self.limits.set_class(group, class),
+            Command::AnnounceSetPayload { payload } => {
+                self.announce_payload = Some(payload);
+                self.announce(swarm);
+            }
             Command::SetLimit {
                 class,
                 scope,
@@ -741,6 +805,7 @@ impl State {
             }
         }
         self.reserve(swarm);
+        self.announce(swarm);
         if now.duration_since(self.last_sweep) >= Duration::from_secs(10) {
             self.limits.sweep(now);
             self.last_sweep = now;
@@ -799,6 +864,77 @@ impl State {
                     self.relay_failed.insert(peer, now);
                 }
             }
+        }
+    }
+
+    /// Publishes the payload when it differs from the one last published. Without a subscribed
+    /// peer gossipsub refuses; the publication stays pending and is tried again on the next tick
+    /// and whenever a peer subscribes.
+    fn announce(&mut self, swarm: &mut Swarm<Behaviour>) {
+        let (Some(topic), Some(payload)) = (&self.announce_topic, &self.announce_payload) else {
+            return;
+        };
+        if self.announce_published.as_ref() == Some(payload) {
+            return;
+        }
+        let Some(gossipsub) = swarm.behaviour_mut().gossipsub.as_mut() else {
+            return;
+        };
+        let frame = wire::encode_announcement(&self.delegation, payload);
+        match gossipsub.publish(topic.clone(), frame) {
+            Ok(_) | Err(gossipsub::PublishError::Duplicate) => {
+                self.announce_published = Some(payload.clone());
+            }
+            Err(gossipsub::PublishError::NoPeersSubscribedToTopic)
+            | Err(gossipsub::PublishError::AllQueuesFull(_)) => {}
+            // Too large or unsignable cannot get better by trying again.
+            Err(_) => self.announce_published = Some(payload.clone()),
+        }
+    }
+
+    fn gossipsub_event(&mut self, swarm: &mut Swarm<Behaviour>, event: gossipsub::Event) {
+        match event {
+            gossipsub::Event::Subscribed { .. } => self.announce(swarm),
+            gossipsub::Event::Message {
+                propagation_source,
+                message_id,
+                message,
+            } => {
+                let now = Instant::now();
+                let checked = (|| {
+                    let source = message.source?;
+                    let node = keys::key_of(&source)?;
+                    let frame = wire::decode_announcement(&message.data)?;
+                    let delegation = Delegation::parse(frame.delegation).ok()?;
+                    delegation.verify_for(&node, now_ms()).ok()?;
+                    Some((source, node, delegation.group, frame.payload))
+                })();
+                let acceptance = match checked {
+                    None => gossipsub::MessageAcceptance::Reject,
+                    Some((_, _, group, _)) if self.limits.class_of(&group) == LP2P_CLASS_BLOCKED => {
+                        gossipsub::MessageAcceptance::Reject
+                    }
+                    Some((source, node, group, payload)) => {
+                        if self.announce_rate.allow(source, now) {
+                            self.emit(
+                                EventBuilder::new(LP2P_EV_ANNOUNCEMENT)
+                                    .group(group)
+                                    .node(node)
+                                    .data(payload),
+                            );
+                            gossipsub::MessageAcceptance::Accept
+                        } else {
+                            // Not the sender's fault as far as this node can tell, so not a
+                            // rejection -- just not passed on.
+                            gossipsub::MessageAcceptance::Ignore
+                        }
+                    }
+                };
+                if let Some(gossipsub) = swarm.behaviour_mut().gossipsub.as_mut() {
+                    gossipsub.report_message_validation_result(&message_id, &propagation_source, acceptance);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -933,6 +1069,7 @@ impl State {
                 | identify::Event::Pushed { peer_id, info, .. },
             )) => self.identified(swarm, peer_id, info),
             SwarmEvent::Behaviour(BehaviourEvent::Rpc(event)) => self.rpc_event(swarm, event),
+            SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(event)) => self.gossipsub_event(swarm, event),
             _ => {}
         }
     }

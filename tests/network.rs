@@ -57,6 +57,7 @@ fn key_of_seed(seed: [u8; 32]) -> lp2p_key {
 struct Setup {
     reachability: u8,
     dcutr: u8,
+    announce: u8,
 }
 
 impl Default for Setup {
@@ -64,6 +65,7 @@ impl Default for Setup {
         Setup {
             reachability: LP2P_REACH_UNKNOWN,
             dcutr: 1,
+            announce: 1,
         }
     }
 }
@@ -121,6 +123,7 @@ fn start_with(
     options.rpc_timeout_ms = 3000;
     options.reachability = setup.reachability;
     options.dcutr = setup.dcutr;
+    options.announce.enabled = setup.announce;
 
     let mut handle = std::ptr::null_mut();
     match unsafe { lp2p_start(&options, &mut handle) } {
@@ -363,10 +366,12 @@ fn a_private_node_is_called_through_a_relay(dcutr: u8, seed: u8) {
     let public = Setup {
         reachability: LP2P_REACH_PUBLIC,
         dcutr,
+        ..Setup::default()
     };
     let private = Setup {
         reachability: LP2P_REACH_PRIVATE,
         dcutr,
+        ..Setup::default()
     };
     let relay = start_as([seed; 32], [seed.wrapping_add(0x80); 32], public).unwrap();
     let relay_address = relay.listen_address();
@@ -532,4 +537,94 @@ fn limits_apply_per_class_and_a_blocked_group_is_refused() {
     assert_eq!(stats.rpc_limited, 2);
     server.shutdown();
     caller.shutdown();
+}
+
+impl TestNode {
+    fn announce(&self, payload: &[u8]) -> i32 {
+        unsafe { lp2p_announce_set_payload(self.handle, payload.as_ptr(), payload.len()) }
+    }
+
+    fn announcements(&self, within: Duration) -> Vec<Event> {
+        let deadline = Instant::now() + within;
+        let mut found = Vec::new();
+        while Instant::now() < deadline {
+            for event in self.poll(50) {
+                if event.header.r#type == LP2P_EV_ANNOUNCEMENT {
+                    found.push(event);
+                }
+            }
+        }
+        found
+    }
+}
+
+#[test]
+fn an_announcement_reaches_every_subscribed_node_once_per_change() {
+    let hub = start([70; 32], [0x70; 32]).unwrap();
+    let speaker = start([71; 32], [0x71; 32]).unwrap();
+    let listener = start([72; 32], [0x72; 32]).unwrap();
+    let hub_address = hub.listen_address();
+    for node in [&speaker, &listener] {
+        node.add_address(&hub, &hub_address);
+        node.bootstrap();
+    }
+    // Subscriptions travel with the connections; the mesh forms on gossipsub's one-second heartbeat.
+    thread::sleep(Duration::from_secs(2));
+
+    assert_eq!(speaker.announce(b"api 1, https://speaker.example"), LP2P_OK);
+    let heard = listener.wait_for(Duration::from_secs(10), |e| {
+        e.header.r#type == LP2P_EV_ANNOUNCEMENT
+    });
+    assert_eq!(heard.header.node, speaker.key);
+    assert_eq!(heard.header.group, speaker.group);
+    assert_eq!(heard.data, b"api 1, https://speaker.example");
+    // The hub heard it too, and nobody hears their own.
+    hub.wait_for(Duration::from_secs(5), |e| {
+        e.header.r#type == LP2P_EV_ANNOUNCEMENT && e.header.node == speaker.key
+    });
+    assert!(speaker.announcements(Duration::from_millis(300)).is_empty());
+
+    // The same payload again is not announced again; a changed one is.
+    assert_eq!(speaker.announce(b"api 1, https://speaker.example"), LP2P_OK);
+    assert!(listener.announcements(Duration::from_secs(2)).is_empty());
+    assert_eq!(speaker.announce(b"api 2"), LP2P_OK);
+    let heard = listener.wait_for(Duration::from_secs(10), |e| {
+        e.header.r#type == LP2P_EV_ANNOUNCEMENT
+    });
+    assert_eq!(heard.data, b"api 2");
+
+    // A listener that blocked the speaker's group does not hear it any more; the hub still does.
+    assert_eq!(
+        unsafe { lp2p_peer_set_class(listener.handle, speaker.group.as_ptr(), LP2P_CLASS_BLOCKED) },
+        LP2P_OK
+    );
+    assert_eq!(speaker.announce(b"api 3"), LP2P_OK);
+    hub.wait_for(Duration::from_secs(10), |e| {
+        e.header.r#type == LP2P_EV_ANNOUNCEMENT && e.data == b"api 3"
+    });
+    assert!(listener.announcements(Duration::from_secs(2)).is_empty());
+
+    // The speaker has used three announcements within seconds; the fourth is not passed on.
+    assert_eq!(speaker.announce(b"api 4"), LP2P_OK);
+    assert!(
+        hub.announcements(Duration::from_secs(2)).is_empty(),
+        "the hub reported a fourth announcement within ten seconds"
+    );
+
+    // Too large is refused; with announcements off there is nothing to set.
+    assert_eq!(speaker.announce(&[0u8; 1025]), LP2P_ERR_INVALID_ARGUMENT);
+    let quiet = start_as(
+        [73; 32],
+        [0x73; 32],
+        Setup {
+            announce: 0,
+            ..Setup::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(quiet.announce(b"x"), LP2P_ERR_UNAVAILABLE);
+    quiet.shutdown();
+    hub.shutdown();
+    speaker.shutdown();
+    listener.shutdown();
 }

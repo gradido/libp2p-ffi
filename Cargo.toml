@@ -21,6 +21,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 libp2p = { version = "=0.56.0", default-features = false, features = [
     "dcutr",
     "ed25519",
+    "gossipsub",
     "identify",
     "kad",
     "macros",

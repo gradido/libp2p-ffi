@@ -30,7 +30,7 @@ community and a node one of its instances.
 | connection limits: total, per peer, pending incoming | done |
 | AutoNAT | not yet — `reachability` is configured; UNKNOWN behaves as PUBLIC |
 | peer classes per group, blocked groups, token-bucket limits per class, scope (peer, IP prefix, global) and protocol | done — checked once a request and its delegation have arrived |
-| announcement over gossipsub | not yet — the call answers `LP2P_ERR_UNAVAILABLE` |
+| announcement over gossipsub: signed, published on change, delegation checked before it is reported or forwarded, blocked groups dropped, at most one per ten seconds per node (three in reserve) | done |
 | interop test against js-libp2p | not yet |
 
 ## Layout
@@ -50,7 +50,7 @@ scripts/c-smoke.sh     links tests/c/smoke.c against that object with cc and zig
 tests/abi_layout.rs    the C compiler's layout of the header against the Rust one
 tests/network.rs       nodes on loopback, driven through the C interface: group calls with
                        failover, a private node reached through a relay, with and without DCUtR,
-                       limits per class and a blocked group
+                       limits per class and a blocked group, announcements
 ```
 
 ## Build and test
@@ -101,6 +101,12 @@ delegation node key (32) | group key (32) | expires_ms, big endian (8, 0 = never
 
 Every node announces itself as a Kademlia provider under its group key (the raw 32 bytes). A
 stream closed without a response is a rejection.
+
+```text
+announcement   u8 1 | delegation (136) | payload
+               as the data of a gossipsub message the node signs (strict validation), on the
+               topic "<dht_protocol>/announce" unless the caller names another
+```
 
 ## License
 

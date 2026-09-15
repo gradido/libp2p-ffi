@@ -77,6 +77,19 @@ pub fn decode_request(frame: &[u8]) -> Option<Request<'_>> {
     })
 }
 
+/// An announcement: the same shape as a response, carried in a gossipsub message the node signs.
+///
+/// ```text
+/// announcement   u8 version = 1 | 136 bytes the announcing node's delegation | payload
+/// ```
+pub fn encode_announcement(delegation: &[u8], payload: &[u8]) -> Vec<u8> {
+    encode_response(delegation, payload)
+}
+
+pub fn decode_announcement(frame: &[u8]) -> Option<Response<'_>> {
+    decode_response(frame)
+}
+
 pub fn encode_response(delegation: &[u8], payload: &[u8]) -> Vec<u8> {
     debug_assert_eq!(delegation.len(), LP2P_DELEGATION_BYTES);
     let mut out = Vec::with_capacity(1 + LP2P_DELEGATION_BYTES + payload.len());
