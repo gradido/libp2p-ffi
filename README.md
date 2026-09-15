@@ -26,7 +26,7 @@ community and a node one of its instances.
 | delegation checked on every request and response | done |
 | TCP + Noise + Yamux, QUIC | done |
 | circuit relay v2: a PRIVATE node reserves on up to two relays and announces only relayed addresses; a node that is not PRIVATE relays for others, with every libp2p limit configurable | done |
-| DCUtR: a relayed connection is upgraded by hole punching | wired, **not working yet**: on loopback the attempt fails with `NoAddresses` because the calling side has no observed-address candidate. Calls still succeed over the relay. Needs a look with a real NAT |
+| DCUtR: a relayed connection is upgraded by hole punching, reported as `LP2P_EV_HOLE_PUNCH` | done — verified through NAT in Docker (`interop/holepunch`): TCP and QUIC upgrade through cone NAT, and stay relayed through symmetric NAT |
 | connection limits: total, per peer, pending incoming | done |
 | AutoNAT: a node configured UNKNOWN is moved to PUBLIC or PRIVATE by dial-back probes, and reserves on relays when it turns out private | done — verified on loopback with `--features test-loopback`; the move back from PRIVATE to PUBLIC is implemented but not tested |
 | peer classes per group, blocked groups, token-bucket limits per class, scope (peer, IP prefix, global) and protocol | done — checked once a request and its delegation have arrived |
@@ -47,6 +47,8 @@ src/keys.rs            32-byte ed25519 keys <-> peer ids
 src/limits.rs          peer classes and token buckets
 scripts/localize.sh    release build -> dist/<target>/libp2p_ffi.o, .h, SHA256SUMS
 scripts/c-smoke.sh     links tests/c/smoke.c against that object with cc and zig cc
+examples/holepunch.rs  one node of the NAT test, by ROLE
+interop/holepunch/     two nodes behind NAT routers and a relay, in Docker
 tests/abi_layout.rs    the C compiler's layout of the header against the Rust one
 tests/network.rs       nodes on loopback, driven through the C interface: group calls with
                        failover, a private node reached through a relay, with and without DCUtR,
@@ -58,12 +60,46 @@ tests/network.rs       nodes on loopback, driven through the C interface: group 
 ```sh
 cargo test                  # unit tests, ABI layout (needs a C compiler), network on loopback
 cargo test --features test-loopback   # also AutoNAT, which needs loopback addresses accepted
+interop/holepunch/run.sh              # hole punching through NAT, in Docker, no root needed
 scripts/localize.sh         # dist/host/libp2p_ffi.o
 scripts/c-smoke.sh          # the shipped object, linked from C and run
 ```
 
 The toolchain is pinned in `rust-toolchain.toml`, and libp2p to an exact version in `Cargo.toml`:
 a libp2p upgrade is a deliberate release, not a lockfile update.
+
+## Hole punching through NAT
+
+Loopback has no NAT, so hole punching cannot be tested there. `interop/holepunch` builds one:
+
+```text
+lan-a 10.99.1.0/24          public 10.99.0.0/24          lan-b 10.99.2.0/24
+dialer .10 -- router-a .2 | .11 -- relay .10 -- .12 | .2 router-b -- .10 listener
+```
+
+The routers are Debian containers with `iptables`: MASQUERADE for cone NAT, `--random-fully` for
+symmetric NAT, nothing forwarded in that the LAN did not ask for, and unsolicited packets to the
+router dropped rather than answered. All networks are internal, so nothing leaves the host.
+`run.sh` builds the `holepunch` example on the host (the images are bookworm-slim plus that binary,
+no Rust image), runs every transport against every NAT and prints one line each:
+
+```text
+tcp   cone      exit 0  as-expected transport=tcp rpc=ok first_connection_relayed=true hole_punch=direct ...
+tcp   symmetric exit 1  as-expected transport=tcp rpc=ok first_connection_relayed=true hole_punch=none
+quic  cone      exit 0  as-expected transport=quic rpc=ok first_connection_relayed=true hole_punch=direct ...
+quic  symmetric exit 1  as-expected transport=quic rpc=ok first_connection_relayed=true hole_punch=none
+```
+
+`run.sh quic cone` runs one combination, `VERBOSE=1` prints every container's log, and
+`LP2P_TRACE="libp2p_dcutr=debug"` adds libp2p's own tracing to the nodes. It works with rootless
+Docker; the routers need `NET_ADMIN`, which Docker grants inside the container without root on the
+host.
+
+Two things this test found in the module, both fixed: a node listening on `0.0.0.0` dialed before
+it knew its interface addresses, so the first connections left from random ports and peers punched
+towards mappings that did not lead back -- `lp2p_start` now waits for them; and a router that
+answers an early SYN with a reset kills the punch, which is why the test routers drop it, as real
+ones do.
 
 ## What ships: a localized object
 

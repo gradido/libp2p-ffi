@@ -92,6 +92,7 @@ pub const LP2P_EV_PEER_DISCOVERED: u16 = 9;
 pub const LP2P_EV_DHT_RESULT: u16 = 10;
 pub const LP2P_EV_LIMITED: u16 = 11;
 pub const LP2P_EV_OVERFLOW: u16 = 12;
+pub const LP2P_EV_HOLE_PUNCH: u16 = 13;
 
 pub const LP2P_EVF_LAST: u16 = 1;
 

@@ -1,0 +1,7 @@
+# A node of the hole-punching test: the holepunch example, built on the host by run.sh.
+# bookworm, because the host that builds it is; the binary links against its glibc.
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends iproute2 && rm -rf /var/lib/apt/lists/*
+COPY bin/holepunch /usr/local/bin/holepunch
+COPY node.sh /usr/local/bin/node.sh
+ENTRYPOINT ["/usr/local/bin/node.sh"]

@@ -37,6 +37,8 @@ use crate::wire::{self, RPC_PROTOCOL, RawCodec};
 /// becomes one publication instead of one per peer.
 const PROVIDE_DEBOUNCE: Duration = Duration::from_secs(2);
 const TICK: Duration = Duration::from_millis(250);
+/// How long lp2p_start waits for its listeners to know their addresses.
+const LISTEN_READY_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a node that failed a call is asked last. A provider record outlives its node by up to
 /// its TTL, and without this every call to the group would try the dead node first half the time.
 const FAILURE_PENALTY: Duration = Duration::from_secs(5 * 60);
@@ -288,13 +290,18 @@ fn run_thread(
                     return;
                 }
             };
+            let mut listeners = Vec::new();
             for address in &config.listen {
-                if swarm.listen_on(address.clone()).is_err() {
-                    let _ = ready.send(LP2P_ERR_NETWORK);
-                    return;
+                match swarm.listen_on(address.clone()) {
+                    Ok(listener) => listeners.push((listener, is_unspecified(address))),
+                    Err(_) => {
+                        let _ = ready.send(LP2P_ERR_NETWORK);
+                        return;
+                    }
                 }
             }
             let mut state = State::new(&config, &swarm, shared);
+            state.await_listeners(&mut swarm, listeners).await;
             let reachability = match config.reachability {
                 Reachability::Public => LP2P_REACH_PUBLIC,
                 Reachability::Private => LP2P_REACH_PRIVATE,
@@ -523,6 +530,9 @@ struct State {
     reachability: Reachability,
     /// Direct listen addresses, to make external again when AutoNAT finds the node public.
     listening: HashSet<Multiaddr>,
+    /// A node listening on 0.0.0.0 or :: learns every interface as a listen address, loopback
+    /// included; that one is useless to anyone else and is not announced.
+    listens_on_wildcard: bool,
     relay_client: bool,
     /// Peers that offered to relay, with the address this node reached them on.
     relay_candidates: HashMap<PeerId, Multiaddr>,
@@ -591,6 +601,14 @@ fn without_peer(address: &Multiaddr) -> Multiaddr {
         .collect()
 }
 
+fn is_loopback(address: &Multiaddr) -> bool {
+    match address.iter().next() {
+        Some(Protocol::Ip4(ip)) => ip.is_loopback(),
+        Some(Protocol::Ip6(ip)) => ip.is_loopback(),
+        _ => false,
+    }
+}
+
 fn is_unspecified(address: &Multiaddr) -> bool {
     match address.iter().next() {
         Some(Protocol::Ip4(ip)) => ip.is_unspecified(),
@@ -624,6 +642,7 @@ impl State {
             configured: config.reachability,
             reachability: config.reachability,
             listening: HashSet::new(),
+            listens_on_wildcard: config.listen.iter().any(is_unspecified),
             relay_client: config.relay.client,
             relay_candidates: HashMap::new(),
             reservations: HashMap::new(),
@@ -639,6 +658,34 @@ impl State {
             announce_payload: None,
             announce_published: None,
             announce_rate: SourceRate::new(ANNOUNCE_INTERVAL, ANNOUNCE_BURST),
+        }
+    }
+
+    /// Drives the swarm until every listener has reported an address it can dial from, at most
+    /// LISTEN_READY_TIMEOUT. A listener on 0.0.0.0 learns its interfaces asynchronously, and TCP
+    /// reuses a listen port for a dial only once it is known: a dial before that leaves from a
+    /// random port, the peer observes that port, and hole punching aims at a mapping that does not
+    /// lead back. Loopback does not count for a wildcard listener -- it is never the way out.
+    async fn await_listeners(&mut self, swarm: &mut Swarm<Behaviour>, mut pending: Vec<(ListenerId, bool)>) {
+        let deadline = tokio::time::Instant::now() + LISTEN_READY_TIMEOUT;
+        while !pending.is_empty() {
+            let event = match tokio::time::timeout_at(deadline, swarm.select_next_some()).await {
+                Ok(event) => event,
+                Err(_) => return,
+            };
+            if let SwarmEvent::NewListenAddr {
+                listener_id, address, ..
+            } = &event
+            {
+                pending
+                    .retain(|(id, wildcard)| !(id == listener_id && (!*wildcard || !is_loopback(address))));
+            }
+            if let SwarmEvent::ListenerClosed { listener_id, .. }
+            | SwarmEvent::ListenerError { listener_id, .. } = &event
+            {
+                pending.retain(|(id, _)| id != listener_id);
+            }
+            self.swarm_event(swarm, event);
         }
     }
 
@@ -997,7 +1044,9 @@ impl State {
         } else if was_private {
             // Reachable after all: the direct addresses again, and the relays released.
             for address in self.listening.clone() {
-                swarm.add_external_address(address);
+                if !(self.listens_on_wildcard && is_loopback(&address)) {
+                    swarm.add_external_address(address);
+                }
             }
             let relayed: Vec<Multiaddr> = swarm
                 .external_addresses()
@@ -1102,7 +1151,12 @@ impl State {
                 } else if !is_unspecified(&address) {
                     self.listening.insert(address.clone());
                 }
-                if !is_relayed(&address) && !self.is_private() && !is_unspecified(&address) {
+                let loopback_of_wildcard = self.listens_on_wildcard && is_loopback(&address);
+                if !is_relayed(&address)
+                    && !self.is_private()
+                    && !is_unspecified(&address)
+                    && !loopback_of_wildcard
+                {
                     // A specific address a public node was told to listen on is taken as
                     // reachable. A private node announces only relayed addresses.
                     swarm.add_external_address(address.clone());
@@ -1164,6 +1218,25 @@ impl State {
             )) => self.identified(swarm, peer_id, info),
             SwarmEvent::Behaviour(BehaviourEvent::Rpc(event)) => self.rpc_event(swarm, event),
             SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(event)) => self.gossipsub_event(swarm, event),
+            SwarmEvent::Behaviour(BehaviourEvent::Dcutr(event)) => {
+                let record = match event.result {
+                    Ok(connection) => {
+                        let address = self
+                            .connections
+                            .get(&connection)
+                            .map(|a| a.to_string())
+                            .unwrap_or_default();
+                        EventBuilder::new(LP2P_EV_HOLE_PUNCH)
+                            .node(peer_key(&event.remote_peer_id))
+                            .data(address.as_bytes())
+                    }
+                    Err(error) => EventBuilder::new(LP2P_EV_HOLE_PUNCH)
+                        .node(peer_key(&event.remote_peer_id))
+                        .reason(1)
+                        .data(format!("{error:?}").as_bytes()),
+                };
+                self.emit(record);
+            }
             SwarmEvent::Behaviour(BehaviourEvent::Autonat(autonat::Event::StatusChanged { new, .. })) => {
                 self.nat_status(swarm, new)
             }

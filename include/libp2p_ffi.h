@@ -159,6 +159,9 @@ typedef struct lp2p_options {
  * LP2P_LIMITED_BLOCKED. At most ten per second; lp2p_stats.rpc_limited counts all of them. */
 #define LP2P_EV_LIMITED 11
 #define LP2P_EV_OVERFLOW 12 /* id: how many events were dropped */
+/* node; reason 0: a relayed connection was upgraded to a direct one by hole punching, data: the
+ * direct address. reason 1: the attempt failed and the connection stays relayed, data: why. */
+#define LP2P_EV_HOLE_PUNCH 13
 
 #define LP2P_EVF_LAST 1u
 
@@ -214,8 +217,10 @@ uint32_t lp2p_abi_version(void);
 void lp2p_options_default(lp2p_options *opt);
 
 /**
- * Starts the node on the module's own threads. Listening has begun when this returns; the
- * addresses arrive as LP2P_EV_LISTENING.
+ * Starts the node on the module's own threads. Listening has begun when this returns: it waits
+ * until every listener knows an address other than loopback, at most two seconds, so that the
+ * first dials leave from the listen port -- hole punching depends on it. The addresses arrive as
+ * LP2P_EV_LISTENING.
  */
 int32_t lp2p_start(const lp2p_options *opt, lp2p **out);
 
