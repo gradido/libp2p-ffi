@@ -1,0 +1,45 @@
+[package]
+name = "libp2p-ffi"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+authors = ["einhornimmond <info@einhornimmond.de>"]
+description = "rust-libp2p behind a C interface: DHT lookup of groups of nodes, request and response with failover, relay"
+license = "Apache-2.0"
+repository = "https://github.com/gradido/libp2p-ffi"
+publish = false
+
+[lib]
+name = "libp2p_ffi"
+# staticlib is what gets localized into libp2p_ffi.o (scripts/localize.sh), cdylib is for callers
+# that prefer a shared library, rlib is what the Rust tests link.
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+# Pinned exactly: the module is released rarely and a network runs old releases for years, so a
+# libp2p version is raised deliberately, with the interop tests green -- never by a lockfile update.
+libp2p = { version = "=0.56.0", default-features = false, features = [
+    "ed25519",
+    "identify",
+    "kad",
+    "macros",
+    "noise",
+    "quic",
+    "request-response",
+    "tcp",
+    "tokio",
+    "yamux",
+] }
+async-trait = "0.1"
+futures = "0.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[profile.release]
+# Measured: fat LTO and opt-level "s" take the module from 7.05 MB to 4.06 MB with no measurable
+# difference in DHT lookups; "z" buys nothing more, thin LTO makes it larger. panic must stay
+# "unwind": a panic has to come back through the boundary as LP2P_ERR_PANIC, not end the host.
+lto = "fat"
+codegen-units = 1
+opt-level = "s"
+panic = "unwind"
+strip = true
