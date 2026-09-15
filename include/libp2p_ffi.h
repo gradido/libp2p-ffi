@@ -61,7 +61,8 @@ typedef struct lp2p_rate {
 } lp2p_rate;
 
 /* Frozen. libp2p's own relay limits; there is no bytes-per-second cap, the bound is what these
- * multiply to. */
+ * multiply to. The server side applies only to a node that is not PRIVATE. A rate with any zero
+ * field switches that limiter off. */
 typedef struct lp2p_relay_options {
     uint8_t server; /* serve as a relay when reachable */
     uint8_t client; /* reserve a relay when not reachable */
@@ -110,8 +111,8 @@ typedef struct lp2p_options {
     uint32_t rpc_max_response_bytes;
     uint32_t rpc_timeout_ms;
     uint8_t quic;
-    uint8_t dcutr;
-    uint8_t autonat;
+    uint8_t dcutr;   /* upgrade a relayed connection to a direct one by hole punching */
+    uint8_t autonat; /* not implemented in this release; see reachability */
     /* 0 means no limit of the module's own. */
     uint32_t max_connections;
     uint32_t max_connections_per_peer;
@@ -121,12 +122,25 @@ typedef struct lp2p_options {
     /* Bound of the internal event queue. What does not fit is dropped and reported as
      * LP2P_EV_OVERFLOW, never silently. */
     size_t event_queue_bytes;
+    /* LP2P_REACH_*: whether other nodes can dial this one directly.
+     *   PUBLIC   it listens on addresses others can reach -- a server with a public address.
+     *            It announces them, and with relay.server it relays for others.
+     *   PRIVATE  it cannot be dialed -- behind NAT, no forwarded port. It reserves a slot on up
+     *            to two relays among its peers (relay.client), announces only the relayed
+     *            addresses, and never relays for others.
+     *   UNKNOWN  the default; behaves as PUBLIC until AutoNAT decides, which is not implemented
+     *            in this release. */
+    uint8_t reachability;
 } lp2p_options;
 
 /* Events. One record per event, whole records only, each followed by its data. */
-#define LP2P_EV_LISTENING 1         /* data: the multiaddr, UTF-8 */
-#define LP2P_EV_REACHABILITY 2      /* reason: LP2P_REACH_*; data: external multiaddr if any */
-#define LP2P_EV_PEER_CONNECTED 3    /* node */
+#define LP2P_EV_LISTENING 1 /* data: the multiaddr, UTF-8 */
+#define LP2P_EV_REACHABILITY                                                                       \
+    2 /* reason: LP2P_REACH_*. Once at start with the configured value;
+                                       again whenever AutoNAT changes it, once AutoNAT is in */
+#define LP2P_EV_PEER_CONNECTED                                                                     \
+    3                               /* node; data: the address of the first connection, UTF-8 --
+                                       it contains /p2p-circuit when that connection is relayed */
 #define LP2P_EV_PEER_DISCONNECTED 4 /* node */
 #define LP2P_EV_RPC_REQUEST                                                                        \
     5                             /* id, group and node (delegation checked), protocol,

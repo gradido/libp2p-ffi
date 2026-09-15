@@ -36,6 +36,8 @@ struct TestNode {
     handle: *mut lp2p,
     key: lp2p_key,
     group: lp2p_key,
+    /// Events a wait_for saw but was not waiting for; the next wait_for looks at them first.
+    backlog: std::cell::RefCell<std::collections::VecDeque<Event>>,
 }
 
 // The handle is thread-safe by contract; the test hands it to a responder thread.
@@ -50,12 +52,37 @@ fn key_of_seed(seed: [u8; 32]) -> lp2p_key {
     key
 }
 
+/// How a test node differs from the defaults.
+#[derive(Clone, Copy)]
+struct Setup {
+    reachability: u8,
+    dcutr: u8,
+}
+
+impl Default for Setup {
+    fn default() -> Self {
+        Setup {
+            reachability: LP2P_REACH_UNKNOWN,
+            dcutr: 1,
+        }
+    }
+}
+
 fn start(node_seed: [u8; 32], group_seed: [u8; 32]) -> Result<TestNode, i32> {
-    start_with(node_seed, group_seed, node_seed)
+    start_with(node_seed, group_seed, node_seed, Setup::default())
+}
+
+fn start_as(node_seed: [u8; 32], group_seed: [u8; 32], setup: Setup) -> Result<TestNode, i32> {
+    start_with(node_seed, group_seed, node_seed, setup)
 }
 
 /// @p delegated_seed is the node the delegation names; a different one makes it invalid.
-fn start_with(node_seed: [u8; 32], group_seed: [u8; 32], delegated_seed: [u8; 32]) -> Result<TestNode, i32> {
+fn start_with(
+    node_seed: [u8; 32],
+    group_seed: [u8; 32],
+    delegated_seed: [u8; 32],
+    setup: Setup,
+) -> Result<TestNode, i32> {
     let key = key_of_seed(node_seed);
     let group = key_of_seed(group_seed);
     let mut delegation = [0u8; LP2P_DELEGATION_BYTES];
@@ -92,10 +119,17 @@ fn start_with(node_seed: [u8; 32], group_seed: [u8; 32], delegated_seed: [u8; 32
     options.rpc_protocol_count = protocol_list.len();
     options.quic = 0;
     options.rpc_timeout_ms = 3000;
+    options.reachability = setup.reachability;
+    options.dcutr = setup.dcutr;
 
     let mut handle = std::ptr::null_mut();
     match unsafe { lp2p_start(&options, &mut handle) } {
-        LP2P_OK => Ok(TestNode { handle, key, group }),
+        LP2P_OK => Ok(TestNode {
+            handle,
+            key,
+            group,
+            backlog: Default::default(),
+        }),
         status => Err(status),
     }
 }
@@ -109,12 +143,17 @@ impl TestNode {
     }
 
     fn wait_for(&self, timeout: Duration, mut pred: impl FnMut(&Event) -> bool) -> Event {
+        let mut backlog = self.backlog.borrow_mut();
+        if let Some(position) = backlog.iter().position(&mut pred) {
+            return backlog.remove(position).unwrap();
+        }
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             for event in self.poll(100) {
                 if pred(&event) {
                     return event;
                 }
+                backlog.push_back(event);
             }
         }
         panic!("event did not arrive within {timeout:?}");
@@ -283,7 +322,7 @@ fn a_group_is_called_by_its_key_and_fails_over_to_the_next_node() {
 #[test]
 fn a_node_with_someone_elses_delegation_does_not_start() {
     assert_eq!(
-        start_with([4; 32], [0xc0; 32], [5; 32]).err(),
+        start_with([4; 32], [0xc0; 32], [5; 32], Setup::default()).err(),
         Some(LP2P_ERR_INVALID_ARGUMENT)
     );
 }
@@ -316,4 +355,71 @@ fn a_shut_down_node_leaves_no_thread_waiting() {
     let started = Instant::now();
     node.shutdown();
     assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+/// A private node announces only relayed addresses, so a call that reaches it went through the
+/// relay -- at least until DCUtR has upgraded the connection, which the second variant allows.
+fn a_private_node_is_called_through_a_relay(dcutr: u8, seed: u8) {
+    let public = Setup {
+        reachability: LP2P_REACH_PUBLIC,
+        dcutr,
+    };
+    let private = Setup {
+        reachability: LP2P_REACH_PRIVATE,
+        dcutr,
+    };
+    let relay = start_as([seed; 32], [seed.wrapping_add(0x80); 32], public).unwrap();
+    let relay_address = relay.listen_address();
+
+    let hidden = start_as([seed + 1; 32], [seed.wrapping_add(0x81); 32], private).unwrap();
+    hidden.add_address(&relay, &relay_address);
+    hidden.bootstrap();
+    let circuit = hidden.wait_for(Duration::from_secs(10), |e| {
+        e.header.r#type == LP2P_EV_LISTENING && String::from_utf8_lossy(&e.data).contains("/p2p-circuit")
+    });
+    assert!(String::from_utf8_lossy(&circuit.data).contains(&relay_address));
+
+    let caller = start_as([seed + 2; 32], [seed.wrapping_add(0x82); 32], public).unwrap();
+    caller.add_address(&relay, &relay_address);
+    caller.bootstrap();
+
+    let (hidden_key, hidden_group) = (hidden.key, hidden.group);
+    let (stop, responding) = responder(hidden, "hidden");
+    // The provider record is re-published with the relayed address after the reservation.
+    thread::sleep(Duration::from_secs(3));
+
+    for round in 0..3 {
+        let id = caller.request(&hidden_group, None, 0, format!("through{round}").as_bytes());
+        let answer = caller.outcome(id);
+        assert_eq!(
+            answer.header.r#type, LP2P_EV_RPC_RESPONSE,
+            "round {round}, reason {}",
+            answer.header.reason
+        );
+        assert_eq!(answer.header.node, hidden_key);
+        assert_eq!(answer.data, format!("hidden:through{round}").as_bytes());
+    }
+
+    // The caller's first connection to the hidden node went through the relay.
+    let connected = caller.wait_for(Duration::from_secs(1), |e| {
+        e.header.r#type == LP2P_EV_PEER_CONNECTED && e.header.node == hidden_key
+    });
+    let address = String::from_utf8_lossy(&connected.data).into_owned();
+    assert!(address.contains("/p2p-circuit"), "{address}");
+
+    stop.send(()).unwrap();
+    let (hidden, _) = responding.join().unwrap();
+    hidden.shutdown();
+    caller.shutdown();
+    relay.shutdown();
+}
+
+#[test]
+fn a_private_node_is_called_through_a_relay_alone() {
+    a_private_node_is_called_through_a_relay(0, 40);
+}
+
+#[test]
+fn a_private_node_is_called_through_a_relay_with_hole_punching() {
+    a_private_node_is_called_through_a_relay(1, 50);
 }

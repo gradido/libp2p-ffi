@@ -14,7 +14,7 @@ use libp2p::{Multiaddr, StreamProtocol};
 use crate::abi::*;
 use crate::delegation::{Delegation, now_ms};
 use crate::keys;
-use crate::node::{Command, Config, Node};
+use crate::node::{Command, Config, Node, Reachability, RelayConfig, TokenBucket};
 
 /// The handle C holds.
 #[allow(non_camel_case_types)]
@@ -95,6 +95,22 @@ pub unsafe extern "C" fn lp2p_options_default(opt: *mut lp2p_options) {
     }
 }
 
+/// 0 in a limit field means no limit of the module's own.
+fn limit(value: u32) -> Option<u32> {
+    (value != 0).then_some(value)
+}
+
+/// libp2p's relay limiter holds `limit` tokens and adds one every `interval`; `amount` per
+/// `interval_ms` becomes one per `interval_ms / amount`. Any zero switches the limiter off.
+fn token_bucket(rate: lp2p_rate) -> Option<TokenBucket> {
+    let burst = std::num::NonZeroU32::new(rate.burst)?;
+    if rate.amount == 0 || rate.interval_ms == 0 {
+        return None;
+    }
+    let interval = Duration::from_millis((rate.interval_ms / rate.amount).max(1) as u64);
+    Some(TokenBucket { burst, interval })
+}
+
 unsafe fn config_from(o: &lp2p_options) -> Result<Config, i32> {
     let delegation = Delegation::parse(unsafe { bytes(o.delegation, o.delegation_len)? })
         .map_err(|_| LP2P_ERR_INVALID_ARGUMENT)?;
@@ -125,6 +141,29 @@ unsafe fn config_from(o: &lp2p_options) -> Result<Config, i32> {
         rpc_max_response_bytes: o.rpc_max_response_bytes,
         rpc_timeout: Duration::from_millis(o.rpc_timeout_ms as u64),
         quic: o.quic != 0,
+        dcutr: o.dcutr != 0,
+        reachability: match o.reachability {
+            LP2P_REACH_PRIVATE => Reachability::Private,
+            LP2P_REACH_PUBLIC => Reachability::Public,
+            LP2P_REACH_UNKNOWN => Reachability::Unknown,
+            _ => return Err(LP2P_ERR_INVALID_ARGUMENT),
+        },
+        relay: RelayConfig {
+            server: o.relay.server != 0,
+            client: o.relay.client != 0,
+            max_reservations: o.relay.max_reservations as usize,
+            max_reservations_per_peer: o.relay.max_reservations_per_peer as usize,
+            reservation_duration: Duration::from_secs(o.relay.reservation_duration_s as u64),
+            max_circuits: o.relay.max_circuits as usize,
+            max_circuits_per_peer: o.relay.max_circuits_per_peer as usize,
+            max_circuit_duration: Duration::from_secs(o.relay.max_circuit_duration_s as u64),
+            max_circuit_bytes: o.relay.max_circuit_bytes,
+            circuits_per_peer: token_bucket(o.relay.circuits_per_peer),
+            circuits_per_ip: token_bucket(o.relay.circuits_per_ip),
+        },
+        max_connections: limit(o.max_connections),
+        max_connections_per_peer: limit(o.max_connections_per_peer),
+        max_pending_incoming: limit(o.max_pending_incoming),
         // Below one megabyte-sized response a queue would drop the first large event it meets.
         event_queue_bytes: o.event_queue_bytes.max(o.rpc_max_response_bytes as usize + 4096),
     })
@@ -560,4 +599,51 @@ pub unsafe extern "C" fn lp2p_delegation_verify(
             Ok(LP2P_OK)
         })())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_rate_becomes_libp2ps_token_bucket() {
+        // One circuit per two minutes, thirty in reserve: libp2p's own default.
+        let bucket = token_bucket(lp2p_rate {
+            amount: 1,
+            interval_ms: 120_000,
+            burst: 30,
+        })
+        .unwrap();
+        assert_eq!(
+            (bucket.burst.get(), bucket.interval),
+            (30, Duration::from_secs(120))
+        );
+        // Ten per second is one every 100 ms.
+        let bucket = token_bucket(lp2p_rate {
+            amount: 10,
+            interval_ms: 1000,
+            burst: 5,
+        })
+        .unwrap();
+        assert_eq!(bucket.interval, Duration::from_millis(100));
+        // Any zero switches the limiter off rather than blocking everything.
+        assert!(
+            token_bucket(lp2p_rate {
+                amount: 0,
+                interval_ms: 1000,
+                burst: 5
+            })
+            .is_none()
+        );
+        assert!(
+            token_bucket(lp2p_rate {
+                amount: 1,
+                interval_ms: 1000,
+                burst: 0
+            })
+            .is_none()
+        );
+        assert_eq!(limit(0), None);
+        assert_eq!(limit(7), Some(7));
+    }
 }

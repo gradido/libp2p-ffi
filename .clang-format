@@ -1,0 +1,26 @@
+# The dialect of ../h20Test and of h2o itself, which is where most of the C here is going to be
+# read against: four spaces, 100 columns, a function's brace on its own line and everything
+# else's attached.
+#
+# ../blockchain-core and ../arnm indent by two. They are libraries of small functions; this is
+# server code with a request path several frames deep, and four spaces is what makes that depth
+# visible. The two styles do not meet -- no file is shared between the repositories.
+BasedOnStyle: LLVM
+
+IndentWidth: 4
+UseTab: Never
+TabWidth: 4
+
+ColumnLimit: 100
+
+BreakBeforeBraces: Linux
+AlignAfterOpenBracket: Align
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: false
+AllowShortFunctionsOnASingleLine: false
+
+# The comments in this project carry the reasoning and are wrapped by hand where the wrap says
+# something. Reflowing them would run the paragraphs back together.
+ReflowComments: false
+SortIncludes: true

@@ -77,6 +77,7 @@ pub struct lp2p_options {
     pub relay: lp2p_relay_options,
     pub announce: lp2p_announce_options,
     pub event_queue_bytes: usize,
+    pub reachability: u8,
 }
 
 pub const LP2P_EV_LISTENING: u16 = 1;
@@ -93,6 +94,10 @@ pub const LP2P_EV_LIMITED: u16 = 11;
 pub const LP2P_EV_OVERFLOW: u16 = 12;
 
 pub const LP2P_EVF_LAST: u16 = 1;
+
+pub const LP2P_REACH_UNKNOWN: u8 = 0;
+pub const LP2P_REACH_PUBLIC: u8 = 1;
+pub const LP2P_REACH_PRIVATE: u8 = 2;
 
 pub const LP2P_FAIL_TIMEOUT: u16 = 1;
 pub const LP2P_FAIL_UNREACHABLE: u16 = 2;
@@ -182,5 +187,6 @@ pub fn default_options() -> lp2p_options {
             max_payload_bytes: 1024,
         },
         event_queue_bytes: 1 << 20,
+        reachability: LP2P_REACH_UNKNOWN,
     }
 }

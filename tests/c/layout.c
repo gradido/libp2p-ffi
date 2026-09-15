@@ -30,6 +30,7 @@ int main(void)
     OFF(lp2p_options, relay);
     OFF(lp2p_options, announce);
     OFF(lp2p_options, event_queue_bytes);
+    OFF(lp2p_options, reachability);
     SIZE(lp2p_event);
     OFF(lp2p_event, id);
     OFF(lp2p_event, group);

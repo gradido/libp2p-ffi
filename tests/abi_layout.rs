@@ -100,6 +100,10 @@ fn rust_and_c_agree_on_every_layout() {
             "offsetof.lp2p_options.event_queue_bytes",
             offset_of!(lp2p_options, event_queue_bytes),
         ),
+        (
+            "offsetof.lp2p_options.reachability",
+            offset_of!(lp2p_options, reachability),
+        ),
         ("sizeof.lp2p_event", size_of::<lp2p_event>()),
         ("offsetof.lp2p_event.id", offset_of!(lp2p_event, id)),
         ("offsetof.lp2p_event.group", offset_of!(lp2p_event, group)),

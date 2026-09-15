@@ -4,6 +4,7 @@
 //! runtime thread applies it and pushes what follows into the event queue the caller polls.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::num::NonZeroU32;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -11,12 +12,17 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
+use libp2p::core::transport::ListenerId;
 use libp2p::identity::Keypair;
 use libp2p::kad::{self, store::MemoryStore};
 use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{self, InboundRequestId, OutboundRequestId, ProtocolSupport, ResponseChannel};
+use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, identify, noise, tcp, yamux};
+use libp2p::{
+    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, connection_limits, dcutr, identify, noise, relay,
+    tcp, yamux,
+};
 use tokio::sync::mpsc;
 
 use crate::abi::*;
@@ -35,6 +41,40 @@ const TICK: Duration = Duration::from_millis(250);
 const FAILURE_PENALTY: Duration = Duration::from_secs(5 * 60);
 /// Bound of the per-group and per-peer memory behind the ordering above.
 const MAX_REMEMBERED: usize = 4096;
+/// How many relays a private node holds a reservation on. Two, so that losing one relay does not
+/// make the node unreachable while it reserves on another.
+const MAX_RESERVATIONS: usize = 2;
+/// How long a relay that refused or dropped a reservation is left alone.
+const RELAY_RETRY: Duration = Duration::from_secs(60);
+const MAX_RELAY_CANDIDATES: usize = 64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reachability {
+    Public,
+    Private,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TokenBucket {
+    pub burst: NonZeroU32,
+    pub interval: Duration,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RelayConfig {
+    pub server: bool,
+    pub client: bool,
+    pub max_reservations: usize,
+    pub max_reservations_per_peer: usize,
+    pub reservation_duration: Duration,
+    pub max_circuits: usize,
+    pub max_circuits_per_peer: usize,
+    pub max_circuit_duration: Duration,
+    pub max_circuit_bytes: u64,
+    pub circuits_per_peer: Option<TokenBucket>,
+    pub circuits_per_ip: Option<TokenBucket>,
+}
 
 pub struct Config {
     pub node_seed: [u8; 32],
@@ -46,6 +86,12 @@ pub struct Config {
     pub rpc_max_response_bytes: u32,
     pub rpc_timeout: Duration,
     pub quic: bool,
+    pub dcutr: bool,
+    pub reachability: Reachability,
+    pub relay: RelayConfig,
+    pub max_connections: Option<u32>,
+    pub max_connections_per_peer: Option<u32>,
+    pub max_pending_incoming: Option<u32>,
     pub event_queue_bytes: usize,
 }
 
@@ -215,6 +261,16 @@ fn run_thread(
                 }
             }
             let mut state = State::new(&config, &swarm, shared);
+            let reachability = match config.reachability {
+                Reachability::Public => LP2P_REACH_PUBLIC,
+                Reachability::Private => LP2P_REACH_PRIVATE,
+                Reachability::Unknown => LP2P_REACH_UNKNOWN,
+            };
+            state.emit(
+                EventBuilder::new(LP2P_EV_REACHABILITY)
+                    .reason(u16::from(reachability))
+                    .build(),
+            );
             state.provide(&mut swarm);
             let _ = ready.send(LP2P_OK);
             state.run(&mut swarm, commands).await;
@@ -232,22 +288,62 @@ fn run_thread(
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
+    // First, so a connection over the limits is refused before any other behaviour sees it.
+    limits: connection_limits::Behaviour,
     address_book: AddressBook,
     kad: kad::Behaviour<MemoryStore>,
     identify: identify::Behaviour,
     rpc: request_response::Behaviour<RawCodec>,
+    // Every node can dial through a relay; only a reachable one serves as one.
+    relay_client: relay::client::Behaviour,
+    relay_server: Toggle<relay::Behaviour>,
+    dcutr: Toggle<dcutr::Behaviour>,
 }
 
-fn make_behaviour(config: &Config, key: &Keypair) -> Behaviour {
+fn relay_server_config(r: &RelayConfig) -> relay::Config {
+    let mut config = relay::Config {
+        max_reservations: r.max_reservations,
+        max_reservations_per_peer: r.max_reservations_per_peer,
+        reservation_duration: r.reservation_duration,
+        max_circuits: r.max_circuits,
+        max_circuits_per_peer: r.max_circuits_per_peer,
+        max_circuit_duration: r.max_circuit_duration,
+        max_circuit_bytes: r.max_circuit_bytes,
+        ..relay::Config::default()
+    };
+    // The defaults carry circuit limiters of their own; the caller's replace them rather than add.
+    config.circuit_src_rate_limiters = Vec::new();
+    if let Some(bucket) = r.circuits_per_peer {
+        config = config.circuit_src_per_peer(bucket.burst, bucket.interval);
+    }
+    if let Some(bucket) = r.circuits_per_ip {
+        config = config.circuit_src_per_ip(bucket.burst, bucket.interval);
+    }
+    config
+}
+
+fn make_behaviour(config: &Config, key: &Keypair, relay_client: relay::client::Behaviour) -> Behaviour {
     let peer = key.public().to_peer_id();
+    let private = config.reachability == Reachability::Private;
+    let limits = connection_limits::Behaviour::new(
+        connection_limits::ConnectionLimits::default()
+            .with_max_established(config.max_connections)
+            .with_max_established_per_peer(config.max_connections_per_peer)
+            .with_max_pending_incoming(config.max_pending_incoming),
+    );
     let mut kad = kad::Behaviour::with_config(
         peer,
         MemoryStore::new(peer),
         kad::Config::new(config.dht_protocol.clone()),
     );
-    // Reachability decides this once AutoNAT is in; until then every node answers queries.
+    // A private node answers queries too, through its relays: a client-mode node would not be in
+    // anyone's routing table, and its relayed addresses could not be looked up.
     kad.set_mode(Some(kad::Mode::Server));
-    let identify = identify::Behaviour::new(identify::Config::new("/lp2p/1".to_string(), key.public()));
+    // A private node's own listen addresses are useless to anyone else and would be tried first;
+    // it tells peers only its external addresses, which are the relayed ones.
+    let identify = identify::Behaviour::new(
+        identify::Config::new("/lp2p/1".to_string(), key.public()).with_hide_listen_addrs(private),
+    );
     // The frame around a payload: version, delegation, and at most 256 bytes of protocol name.
     let overhead = (2 + LP2P_DELEGATION_BYTES + 255) as u64;
     let rpc = request_response::Behaviour::with_codec(
@@ -258,11 +354,18 @@ fn make_behaviour(config: &Config, key: &Keypair) -> Behaviour {
         [(RPC_PROTOCOL, ProtocolSupport::Full)],
         request_response::Config::default().with_request_timeout(config.rpc_timeout),
     );
+    let relay_server = (config.relay.server && !private)
+        .then(|| relay::Behaviour::new(peer, relay_server_config(&config.relay)));
+    let dcutr = config.dcutr.then(|| dcutr::Behaviour::new(peer));
     Behaviour {
+        limits,
         address_book: AddressBook::default(),
         kad,
         identify,
         rpc,
+        relay_client,
+        relay_server: relay_server.into(),
+        dcutr: dcutr.into(),
     }
 }
 
@@ -279,13 +382,17 @@ fn build_swarm(config: &Config, keypair: Keypair) -> Result<Swarm<Behaviour>, i3
     if config.quic {
         Ok(builder
             .with_quic()
-            .with_behaviour(|key| make_behaviour(config, key))
+            .with_relay_client(noise::Config::new, yamux::Config::default)
+            .map_err(|_| LP2P_ERR_NETWORK)?
+            .with_behaviour(|key, relay| make_behaviour(config, key, relay))
             .map_err(|_| LP2P_ERR_NETWORK)?
             .with_swarm_config(idle)
             .build())
     } else {
         Ok(builder
-            .with_behaviour(|key| make_behaviour(config, key))
+            .with_relay_client(noise::Config::new, yamux::Config::default)
+            .map_err(|_| LP2P_ERR_NETWORK)?
+            .with_behaviour(|key, relay| make_behaviour(config, key, relay))
             .map_err(|_| LP2P_ERR_NETWORK)?
             .with_swarm_config(idle)
             .build())
@@ -332,6 +439,16 @@ struct State {
     last_success: HashMap<lp2p_key, PeerId>,
     /// Nodes that failed a call, and when; they are asked last until the penalty is over.
     failed: HashMap<PeerId, Instant>,
+    private: bool,
+    relay_client: bool,
+    /// Peers that offered to relay, with the address this node reached them on.
+    relay_candidates: HashMap<PeerId, Multiaddr>,
+    /// Relays this node holds or requested a reservation on, and the listener that stands for it.
+    reservations: HashMap<PeerId, ListenerId>,
+    /// Relays that refused or dropped a reservation, and when.
+    relay_failed: HashMap<PeerId, Instant>,
+    /// The address each connected peer was dialed on, for the peers this node dialed.
+    dialed: HashMap<PeerId, Multiaddr>,
 }
 
 /// Queues @p peer for @p call: the group's last good node first, recently failed nodes last, the
@@ -369,6 +486,18 @@ fn peer_key(peer: &PeerId) -> lp2p_key {
     keys::key_of(peer).unwrap_or([0; 32])
 }
 
+fn is_relayed(address: &Multiaddr) -> bool {
+    address.iter().any(|p| matches!(p, Protocol::P2pCircuit))
+}
+
+/// @p address without a trailing /p2p/<peer>, so one can be appended.
+fn without_peer(address: &Multiaddr) -> Multiaddr {
+    address
+        .iter()
+        .filter(|p| !matches!(p, Protocol::P2p(_)))
+        .collect()
+}
+
 fn is_unspecified(address: &Multiaddr) -> bool {
     match address.iter().next() {
         Some(Protocol::Ip4(ip)) => ip.is_unspecified(),
@@ -399,6 +528,12 @@ impl State {
             sample_offset: 0,
             last_success: HashMap::new(),
             failed: HashMap::new(),
+            private: config.reachability == Reachability::Private,
+            relay_client: config.relay.client,
+            relay_candidates: HashMap::new(),
+            reservations: HashMap::new(),
+            relay_failed: HashMap::new(),
+            dialed: HashMap::new(),
         }
     }
 
@@ -578,6 +713,7 @@ impl State {
                 );
             }
         }
+        self.reserve(swarm);
         if self.provide_due
             && self
                 .last_provide
@@ -597,6 +733,80 @@ impl State {
         self.shared
             .connections
             .store(swarm.network_info().num_peers() as u32, Ordering::Relaxed);
+    }
+
+    /// Keeps a private node reachable: a reservation on up to MAX_RESERVATIONS relays among the
+    /// peers that offered, skipping relays that failed recently.
+    fn reserve(&mut self, swarm: &mut Swarm<Behaviour>) {
+        if !self.private || !self.relay_client || self.reservations.len() >= MAX_RESERVATIONS {
+            return;
+        }
+        let now = Instant::now();
+        let candidates: Vec<(PeerId, Multiaddr)> = self
+            .relay_candidates
+            .iter()
+            .filter(|(peer, _)| !self.reservations.contains_key(peer))
+            .filter(|(peer, _)| {
+                self.relay_failed
+                    .get(peer)
+                    .is_none_or(|t| now.duration_since(*t) >= RELAY_RETRY)
+            })
+            .map(|(peer, address)| (*peer, address.clone()))
+            .collect();
+        for (peer, address) in candidates {
+            if self.reservations.len() >= MAX_RESERVATIONS {
+                break;
+            }
+            let circuit = without_peer(&address)
+                .with(Protocol::P2p(peer))
+                .with(Protocol::P2pCircuit);
+            match swarm.listen_on(circuit) {
+                Ok(listener) => {
+                    self.reservations.insert(peer, listener);
+                }
+                Err(_) => {
+                    self.relay_failed.insert(peer, now);
+                }
+            }
+        }
+    }
+
+    fn relay_lost(&mut self, listener: ListenerId) {
+        let lost: Vec<PeerId> = self
+            .reservations
+            .iter()
+            .filter(|(_, id)| **id == listener)
+            .map(|(peer, _)| *peer)
+            .collect();
+        for peer in lost {
+            self.reservations.remove(&peer);
+            self.relay_failed.insert(peer, Instant::now());
+        }
+    }
+
+    fn identified(&mut self, swarm: &mut Swarm<Behaviour>, peer: PeerId, info: identify::Info) {
+        let speaks_dht = info.protocols.contains(&self.dht_protocol);
+        if info.protocols.contains(&relay::HOP_PROTOCOL_NAME)
+            && self.relay_candidates.len() < MAX_RELAY_CANDIDATES
+        {
+            // The address this node dialed is known to work; a listen address is a guess.
+            let address = self.dialed.get(&peer).cloned().or_else(|| {
+                info.listen_addrs
+                    .iter()
+                    .find(|a| !is_relayed(a) && !is_unspecified(a))
+                    .cloned()
+            });
+            if let Some(address) = address {
+                self.relay_candidates.insert(peer, address);
+            }
+        }
+        for address in info.listen_addrs {
+            swarm.behaviour_mut().address_book.add(peer, address.clone());
+            if speaks_dht {
+                swarm.behaviour_mut().kad.add_address(&peer, address);
+            }
+        }
+        self.reserve(swarm);
     }
 
     fn routing_sample(&mut self, swarm: &mut Swarm<Behaviour>, max: usize) -> Vec<Record> {
@@ -627,23 +837,40 @@ impl State {
     fn swarm_event(&mut self, swarm: &mut Swarm<Behaviour>, event: SwarmEvent<BehaviourEvent>) {
         match event {
             SwarmEvent::NewListenAddr { address, .. } => {
-                // A specific address the node was told to listen on is taken as reachable. What a
-                // node behind NAT can really be reached on is AutoNAT's to find out, later.
-                if !is_unspecified(&address) {
+                if is_relayed(&address) {
+                    // A reservation was accepted: this is how others reach this node now. Peers
+                    // hear about it at once, and the provider record is re-published with it.
+                    swarm.add_external_address(address.clone());
+                    let peers: Vec<PeerId> = swarm.connected_peers().copied().collect();
+                    swarm.behaviour_mut().identify.push(peers);
+                    self.provide_due = true;
+                } else if !self.private && !is_unspecified(&address) {
+                    // A specific address a public node was told to listen on is taken as
+                    // reachable. A private node announces only relayed addresses.
                     swarm.add_external_address(address.clone());
                 }
                 self.emit(EventBuilder::new(LP2P_EV_LISTENING).data(address.to_string().as_bytes()));
             }
+            SwarmEvent::ListenerClosed { listener_id, .. } => self.relay_lost(listener_id),
+            SwarmEvent::ListenerError { listener_id, .. } => self.relay_lost(listener_id),
             SwarmEvent::ConnectionEstablished {
                 peer_id,
                 num_established,
+                endpoint,
                 ..
             } => {
+                if endpoint.is_dialer() && !is_relayed(endpoint.get_remote_address()) {
+                    self.dialed.insert(peer_id, endpoint.get_remote_address().clone());
+                }
                 if num_established.get() == 1 {
+                    let address = match &endpoint {
+                        libp2p::core::ConnectedPoint::Dialer { address, .. } => address,
+                        libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr,
+                    };
                     self.emit(
                         EventBuilder::new(LP2P_EV_PEER_CONNECTED)
                             .node(peer_key(&peer_id))
-                            .build(),
+                            .data(address.to_string().as_bytes()),
                     );
                 }
             }
@@ -653,6 +880,7 @@ impl State {
                 ..
             } => {
                 if num_established == 0 {
+                    self.dialed.remove(&peer_id);
                     self.emit(
                         EventBuilder::new(LP2P_EV_PEER_DISCONNECTED)
                             .node(peer_key(&peer_id))
@@ -661,19 +889,10 @@ impl State {
                 }
             }
             SwarmEvent::Behaviour(BehaviourEvent::Kad(event)) => self.kad_event(swarm, event),
-            SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received {
-                peer_id,
-                info,
-                ..
-            })) => {
-                let speaks_dht = info.protocols.contains(&self.dht_protocol);
-                for address in info.listen_addrs {
-                    swarm.behaviour_mut().address_book.add(peer_id, address.clone());
-                    if speaks_dht {
-                        swarm.behaviour_mut().kad.add_address(&peer_id, address);
-                    }
-                }
-            }
+            SwarmEvent::Behaviour(BehaviourEvent::Identify(
+                identify::Event::Received { peer_id, info, .. }
+                | identify::Event::Pushed { peer_id, info, .. },
+            )) => self.identified(swarm, peer_id, info),
             SwarmEvent::Behaviour(BehaviourEvent::Rpc(event)) => self.rpc_event(swarm, event),
             _ => {}
         }

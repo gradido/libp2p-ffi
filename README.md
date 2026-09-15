@@ -25,7 +25,10 @@ community and a node one of its instances.
 | RPC pinned to one node | done |
 | delegation checked on every request and response | done |
 | TCP + Noise + Yamux, QUIC | done |
-| circuit relay v2, DCUtR, AutoNAT | not yet — the options are accepted and ignored |
+| circuit relay v2: a PRIVATE node reserves on up to two relays and announces only relayed addresses; a node that is not PRIVATE relays for others, with every libp2p limit configurable | done |
+| DCUtR: a relayed connection is upgraded by hole punching | wired, **not working yet**: on loopback the attempt fails with `NoAddresses` because the calling side has no observed-address candidate. Calls still succeed over the relay. Needs a look with a real NAT |
+| connection limits: total, per peer, pending incoming | done |
+| AutoNAT | not yet — `reachability` is configured; UNKNOWN behaves as PUBLIC |
 | peer classes and rate limits | not yet — the calls answer `LP2P_ERR_UNAVAILABLE` |
 | announcement over gossipsub | not yet — the call answers `LP2P_ERR_UNAVAILABLE` |
 | interop test against js-libp2p | not yet |
@@ -44,7 +47,8 @@ src/keys.rs            32-byte ed25519 keys <-> peer ids
 scripts/localize.sh    release build -> dist/<target>/libp2p_ffi.o, .h, SHA256SUMS
 scripts/c-smoke.sh     links tests/c/smoke.c against that object with cc and zig cc
 tests/abi_layout.rs    the C compiler's layout of the header against the Rust one
-tests/network.rs       nodes on loopback, driven through the C interface
+tests/network.rs       nodes on loopback, driven through the C interface: group calls with
+                       failover, a private node reached through a relay, with and without DCUtR
 ```
 
 ## Build and test

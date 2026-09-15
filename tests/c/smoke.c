@@ -19,7 +19,8 @@ static int start(uint8_t seed_byte, uint8_t group_byte, lp2p **node, lp2p_key ke
 
     memset(seed, seed_byte, sizeof(seed));
     memset(group_seed, group_byte, sizeof(group_seed));
-    if (lp2p_key_from_seed(seed, key) != LP2P_OK || lp2p_key_from_seed(group_seed, group) != LP2P_OK ||
+    if (lp2p_key_from_seed(seed, key) != LP2P_OK ||
+        lp2p_key_from_seed(group_seed, group) != LP2P_OK ||
         lp2p_delegation_sign(group_seed, key, 0, delegation) != LP2P_OK)
         return -1;
 
@@ -38,8 +39,8 @@ static int start(uint8_t seed_byte, uint8_t group_byte, lp2p **node, lp2p_key ke
 }
 
 /* Polls once and hands every record to @p visit; stops early when it answers non-zero. */
-static int drain(lp2p *node, uint8_t *buf, int (*visit)(lp2p *, const lp2p_event *, const uint8_t *, void *),
-                 void *ctx)
+static int drain(lp2p *node, uint8_t *buf,
+                 int (*visit)(lp2p *, const lp2p_event *, const uint8_t *, void *), void *ctx)
 {
     int32_t n = lp2p_poll(node, buf, BUFFER_BYTES, 20);
     size_t offset = 0;
@@ -110,7 +111,8 @@ int main(void)
     struct expect expect;
     int round, result = 0;
 
-    if (start(1, 0xa0, &a, key_a, group_a) != LP2P_OK || start(2, 0xb0, &b, key_b, group_b) != LP2P_OK) {
+    if (start(1, 0xa0, &a, key_a, group_a) != LP2P_OK ||
+        start(2, 0xb0, &b, key_b, group_b) != LP2P_OK) {
         fprintf(stderr, "start failed\n");
         return 1;
     }
@@ -122,7 +124,8 @@ int main(void)
     }
 
     expect.node = key_a;
-    if (lp2p_rpc_request(b, group_a, key_a, 0, (const uint8_t *)"ping", 4, 5000, &expect.id) != LP2P_OK) {
+    if (lp2p_rpc_request(b, group_a, key_a, 0, (const uint8_t *)"ping", 4, 5000, &expect.id) !=
+        LP2P_OK) {
         fprintf(stderr, "request refused\n");
         return 1;
     }
