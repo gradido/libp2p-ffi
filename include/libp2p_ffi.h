@@ -114,7 +114,7 @@ typedef struct lp2p_options {
     uint32_t rpc_timeout_ms;
     uint8_t quic;
     uint8_t dcutr;   /* upgrade a relayed connection to a direct one by hole punching */
-    uint8_t autonat; /* not implemented in this release; see reachability */
+    uint8_t autonat; /* answer other nodes' dial-back probes, and probe itself when UNKNOWN */
     /* 0 means no limit of the module's own. */
     uint32_t max_connections;
     uint32_t max_connections_per_peer;
@@ -130,15 +130,17 @@ typedef struct lp2p_options {
      *   PRIVATE  it cannot be dialed -- behind NAT, no forwarded port. It reserves a slot on up
      *            to two relays among its peers (relay.client), announces only the relayed
      *            addresses, and never relays for others.
-     *   UNKNOWN  the default; behaves as PUBLIC until AutoNAT decides, which is not implemented
-     *            in this release. */
+     *   UNKNOWN  the default. With autonat, AutoNAT decides: the node starts as PUBLIC, asks
+     *            connected peers to dial it back, and switches to PRIVATE -- or back -- by what
+     *            they report, with LP2P_EV_REACHABILITY each time. Without autonat it stays
+     *            PUBLIC. A configured PUBLIC or PRIVATE is never overridden. */
     uint8_t reachability;
 } lp2p_options;
 
 /* Events. One record per event, whole records only, each followed by its data. */
 #define LP2P_EV_LISTENING 1 /* data: the multiaddr, UTF-8 */
-/* reason: LP2P_REACH_*. Once at start with the configured value; again whenever AutoNAT changes
- * it, once AutoNAT is in. */
+/* reason: LP2P_REACH_*. Once at start with the configured value; again whenever AutoNAT moves a
+ * node configured UNKNOWN to PUBLIC or PRIVATE. */
 #define LP2P_EV_REACHABILITY 2
 /* node; data: the address of the first connection, UTF-8 -- it contains /p2p-circuit when that
  * connection is relayed. */

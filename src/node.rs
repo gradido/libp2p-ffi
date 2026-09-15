@@ -20,8 +20,8 @@ use libp2p::request_response::{self, InboundRequestId, OutboundRequestId, Protoc
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::{ConnectionId, NetworkBehaviour, SwarmEvent};
 use libp2p::{
-    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, connection_limits, dcutr, gossipsub, identify,
-    noise, relay, tcp, yamux,
+    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, autonat, connection_limits, dcutr, gossipsub,
+    identify, noise, relay, tcp, yamux,
 };
 use tokio::sync::mpsc;
 
@@ -100,6 +100,7 @@ pub struct Config {
     pub rpc_timeout: Duration,
     pub quic: bool,
     pub dcutr: bool,
+    pub autonat: bool,
     pub reachability: Reachability,
     pub relay: RelayConfig,
     pub max_connections: Option<u32>,
@@ -332,6 +333,19 @@ struct Behaviour {
     relay_server: Toggle<relay::Behaviour>,
     dcutr: Toggle<dcutr::Behaviour>,
     gossipsub: Toggle<gossipsub::Behaviour>,
+    autonat: Toggle<autonat::Behaviour>,
+}
+
+fn autonat_config() -> autonat::Config {
+    let mut config = autonat::Config::default();
+    if cfg!(feature = "test-loopback") {
+        config.only_global_ips = false;
+        config.boot_delay = Duration::from_millis(500);
+        config.retry_interval = Duration::from_secs(1);
+        config.refresh_interval = Duration::from_secs(5);
+        config.throttle_server_period = Duration::ZERO;
+    }
+    config
 }
 
 type BuildError = Box<dyn std::error::Error + Send + Sync>;
@@ -379,7 +393,6 @@ fn make_behaviour(
     relay_client: relay::client::Behaviour,
 ) -> Result<Behaviour, BuildError> {
     let peer = key.public().to_peer_id();
-    let private = config.reachability == Reachability::Private;
     let limits = connection_limits::Behaviour::new(
         connection_limits::ConnectionLimits::default()
             .with_max_established(config.max_connections)
@@ -394,10 +407,11 @@ fn make_behaviour(
     // A private node answers queries too, through its relays: a client-mode node would not be in
     // anyone's routing table, and its relayed addresses could not be looked up.
     kad.set_mode(Some(kad::Mode::Server));
-    // A private node's own listen addresses are useless to anyone else and would be tried first;
-    // it tells peers only its external addresses, which are the relayed ones.
+    // Peers hear only external addresses. A public node makes its listen addresses external, a
+    // private one only its relayed addresses -- and since AutoNAT can move a node from one to the
+    // other at runtime, this cannot be decided once when identify is built.
     let identify = identify::Behaviour::new(
-        identify::Config::new("/lp2p/1".to_string(), key.public()).with_hide_listen_addrs(private),
+        identify::Config::new("/lp2p/1".to_string(), key.public()).with_hide_listen_addrs(true),
     );
     // The frame around a payload: version, delegation, and at most 256 bytes of protocol name.
     let overhead = (2 + LP2P_DELEGATION_BYTES + 255) as u64;
@@ -409,7 +423,7 @@ fn make_behaviour(
         [(RPC_PROTOCOL, ProtocolSupport::Full)],
         request_response::Config::default().with_request_timeout(config.rpc_timeout),
     );
-    let relay_server = (config.relay.server && !private)
+    let relay_server = (config.relay.server && config.reachability != Reachability::Private)
         .then(|| relay::Behaviour::new(peer, relay_server_config(&config.relay)));
     let dcutr = config.dcutr.then(|| dcutr::Behaviour::new(peer));
     let gossipsub = match &config.announce {
@@ -426,6 +440,10 @@ fn make_behaviour(
         relay_server: relay_server.into(),
         dcutr: dcutr.into(),
         gossipsub: gossipsub.into(),
+        autonat: config
+            .autonat
+            .then(|| autonat::Behaviour::new(peer, autonat_config()))
+            .into(),
     })
 }
 
@@ -499,7 +517,12 @@ struct State {
     last_success: HashMap<lp2p_key, PeerId>,
     /// Nodes that failed a call, and when; they are asked last until the penalty is over.
     failed: HashMap<PeerId, Instant>,
-    private: bool,
+    /// What the caller configured; only UNKNOWN lets AutoNAT decide.
+    configured: Reachability,
+    /// What the node currently acts as.
+    reachability: Reachability,
+    /// Direct listen addresses, to make external again when AutoNAT finds the node public.
+    listening: HashSet<Multiaddr>,
     relay_client: bool,
     /// Peers that offered to relay, with the address this node reached them on.
     relay_candidates: HashMap<PeerId, Multiaddr>,
@@ -598,7 +621,9 @@ impl State {
             sample_offset: 0,
             last_success: HashMap::new(),
             failed: HashMap::new(),
-            private: config.reachability == Reachability::Private,
+            configured: config.reachability,
+            reachability: config.reachability,
+            listening: HashSet::new(),
             relay_client: config.relay.client,
             relay_candidates: HashMap::new(),
             reservations: HashMap::new(),
@@ -834,7 +859,7 @@ impl State {
     /// Keeps a private node reachable: a reservation on up to MAX_RESERVATIONS relays among the
     /// peers that offered, skipping relays that failed recently.
     fn reserve(&mut self, swarm: &mut Swarm<Behaviour>) {
-        if !self.private || !self.relay_client || self.reservations.len() >= MAX_RESERVATIONS {
+        if !self.is_private() || !self.relay_client || self.reservations.len() >= MAX_RESERVATIONS {
             return;
         }
         let now = Instant::now();
@@ -938,6 +963,69 @@ impl State {
         }
     }
 
+    fn is_private(&self) -> bool {
+        self.reachability == Reachability::Private
+    }
+
+    /// AutoNAT's verdict. It decides only for a node configured UNKNOWN; a configured node keeps
+    /// what it was told. An unknown verdict changes nothing.
+    fn nat_status(&mut self, swarm: &mut Swarm<Behaviour>, status: autonat::NatStatus) {
+        if self.configured != Reachability::Unknown {
+            return;
+        }
+        let next = match status {
+            autonat::NatStatus::Public(_) => Reachability::Public,
+            autonat::NatStatus::Private => Reachability::Private,
+            autonat::NatStatus::Unknown => return,
+        };
+        if next == self.reachability {
+            return;
+        }
+        let was_private = self.is_private();
+        self.reachability = next;
+        if next == Reachability::Private {
+            // Nobody can dial the direct addresses: stop announcing them and reserve on relays.
+            let direct: Vec<Multiaddr> = swarm
+                .external_addresses()
+                .filter(|a| !is_relayed(a))
+                .cloned()
+                .collect();
+            for address in direct {
+                swarm.remove_external_address(&address);
+            }
+            self.reserve(swarm);
+        } else if was_private {
+            // Reachable after all: the direct addresses again, and the relays released.
+            for address in self.listening.clone() {
+                swarm.add_external_address(address);
+            }
+            let relayed: Vec<Multiaddr> = swarm
+                .external_addresses()
+                .filter(|a| is_relayed(a))
+                .cloned()
+                .collect();
+            for address in relayed {
+                swarm.remove_external_address(&address);
+            }
+            for (_, listener) in self.reservations.drain() {
+                swarm.remove_listener(listener);
+            }
+        }
+        let peers: Vec<PeerId> = swarm.connected_peers().copied().collect();
+        swarm.behaviour_mut().identify.push(peers);
+        self.provide_due = true;
+        let reason = if next == Reachability::Private {
+            LP2P_REACH_PRIVATE
+        } else {
+            LP2P_REACH_PUBLIC
+        };
+        self.emit(
+            EventBuilder::new(LP2P_EV_REACHABILITY)
+                .reason(u16::from(reason))
+                .build(),
+        );
+    }
+
     fn relay_lost(&mut self, listener: ListenerId) {
         let lost: Vec<PeerId> = self
             .reservations
@@ -1011,12 +1099,18 @@ impl State {
                     let peers: Vec<PeerId> = swarm.connected_peers().copied().collect();
                     swarm.behaviour_mut().identify.push(peers);
                     self.provide_due = true;
-                } else if !self.private && !is_unspecified(&address) {
+                } else if !is_unspecified(&address) {
+                    self.listening.insert(address.clone());
+                }
+                if !is_relayed(&address) && !self.is_private() && !is_unspecified(&address) {
                     // A specific address a public node was told to listen on is taken as
                     // reachable. A private node announces only relayed addresses.
                     swarm.add_external_address(address.clone());
                 }
                 self.emit(EventBuilder::new(LP2P_EV_LISTENING).data(address.to_string().as_bytes()));
+            }
+            SwarmEvent::ExpiredListenAddr { address, .. } => {
+                self.listening.remove(&address);
             }
             SwarmEvent::ListenerClosed { listener_id, .. } => self.relay_lost(listener_id),
             SwarmEvent::ListenerError { listener_id, .. } => self.relay_lost(listener_id),
@@ -1070,6 +1164,9 @@ impl State {
             )) => self.identified(swarm, peer_id, info),
             SwarmEvent::Behaviour(BehaviourEvent::Rpc(event)) => self.rpc_event(swarm, event),
             SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(event)) => self.gossipsub_event(swarm, event),
+            SwarmEvent::Behaviour(BehaviourEvent::Autonat(autonat::Event::StatusChanged { new, .. })) => {
+                self.nat_status(swarm, new)
+            }
             _ => {}
         }
     }

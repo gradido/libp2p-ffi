@@ -28,7 +28,7 @@ community and a node one of its instances.
 | circuit relay v2: a PRIVATE node reserves on up to two relays and announces only relayed addresses; a node that is not PRIVATE relays for others, with every libp2p limit configurable | done |
 | DCUtR: a relayed connection is upgraded by hole punching | wired, **not working yet**: on loopback the attempt fails with `NoAddresses` because the calling side has no observed-address candidate. Calls still succeed over the relay. Needs a look with a real NAT |
 | connection limits: total, per peer, pending incoming | done |
-| AutoNAT | not yet — `reachability` is configured; UNKNOWN behaves as PUBLIC |
+| AutoNAT: a node configured UNKNOWN is moved to PUBLIC or PRIVATE by dial-back probes, and reserves on relays when it turns out private | done — verified on loopback with `--features test-loopback`; the move back from PRIVATE to PUBLIC is implemented but not tested |
 | peer classes per group, blocked groups, token-bucket limits per class, scope (peer, IP prefix, global) and protocol | done — checked once a request and its delegation have arrived |
 | announcement over gossipsub: signed, published on change, delegation checked before it is reported or forwarded, blocked groups dropped, at most one per ten seconds per node (three in reserve) | done |
 | interop test against js-libp2p | not yet |
@@ -57,6 +57,7 @@ tests/network.rs       nodes on loopback, driven through the C interface: group 
 
 ```sh
 cargo test                  # unit tests, ABI layout (needs a C compiler), network on loopback
+cargo test --features test-loopback   # also AutoNAT, which needs loopback addresses accepted
 scripts/localize.sh         # dist/host/libp2p_ffi.o
 scripts/c-smoke.sh          # the shipped object, linked from C and run
 ```

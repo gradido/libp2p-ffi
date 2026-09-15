@@ -58,6 +58,8 @@ struct Setup {
     reachability: u8,
     dcutr: u8,
     announce: u8,
+    /// Listen on a loopback port; a node that does not can only dial out.
+    listen: bool,
 }
 
 impl Default for Setup {
@@ -66,6 +68,7 @@ impl Default for Setup {
             reachability: LP2P_REACH_UNKNOWN,
             dcutr: 1,
             announce: 1,
+            listen: true,
         }
     }
 }
@@ -115,7 +118,7 @@ fn start_with(
     options.delegation_len = delegation.len();
     options.group = group;
     options.listen_addrs = listen_list.as_ptr();
-    options.listen_addr_count = 1;
+    options.listen_addr_count = usize::from(setup.listen);
     options.dht_protocol = dht.as_ptr();
     options.rpc_protocols = protocol_list.as_ptr();
     options.rpc_protocol_count = protocol_list.len();
@@ -151,15 +154,48 @@ impl TestNode {
             return backlog.remove(position).unwrap();
         }
         let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
+        let mut found = None;
+        while found.is_none() && Instant::now() < deadline {
+            // The whole batch goes through: what follows the match in it stays for later.
             for event in self.poll(100) {
-                if pred(&event) {
-                    return event;
+                if found.is_none() && pred(&event) {
+                    found = Some(event);
+                } else {
+                    backlog.push_back(event);
                 }
-                backlog.push_back(event);
             }
         }
-        panic!("event did not arrive within {timeout:?}");
+        if let Some(event) = found {
+            return event;
+        }
+        let seen: Vec<String> = backlog
+            .iter()
+            .map(|e| {
+                format!(
+                    "{}:{}:{}",
+                    e.header.r#type,
+                    e.header.reason,
+                    String::from_utf8_lossy(&e.data)
+                )
+            })
+            .collect();
+        panic!("event did not arrive within {timeout:?}; unmatched events: {seen:?}");
+    }
+
+    /// Like wait_for, but answers None instead of failing when nothing matching arrives.
+    fn wait_until(&self, timeout: Duration, mut pred: impl FnMut(&Event) -> bool) -> Option<Event> {
+        let deadline = Instant::now() + timeout;
+        let mut found = None;
+        while found.is_none() && Instant::now() < deadline {
+            for event in self.poll(100) {
+                if found.is_none() && pred(&event) {
+                    found = Some(event);
+                } else {
+                    self.backlog.borrow_mut().push_back(event);
+                }
+            }
+        }
+        found
     }
 
     fn listen_address(&self) -> String {
@@ -627,4 +663,64 @@ fn an_announcement_reaches_every_subscribed_node_once_per_change() {
     hub.shutdown();
     speaker.shutdown();
     listener.shutdown();
+}
+
+/// AutoNAT decides for a node configured UNKNOWN: one that can be dialed back becomes PUBLIC, one
+/// that cannot becomes PRIVATE and reserves on a relay. On loopback only with the test-loopback
+/// feature, which lets AutoNAT accept loopback addresses and probe within seconds:
+/// `cargo test --features test-loopback`.
+#[test]
+#[cfg_attr(not(feature = "test-loopback"), ignore = "needs --features test-loopback")]
+fn autonat_decides_for_a_node_configured_unknown() {
+    let reach = |node: &TestNode, expected: u8| {
+        node.wait_for(Duration::from_secs(30), |e| {
+            e.header.r#type == LP2P_EV_REACHABILITY && e.header.reason == u16::from(expected)
+        });
+    };
+    let server = start_as(
+        [80; 32],
+        [0x90; 32],
+        Setup {
+            reachability: LP2P_REACH_PUBLIC,
+            ..Setup::default()
+        },
+    )
+    .unwrap();
+    let address = server.listen_address();
+
+    let reachable = start_as([81; 32], [0x91; 32], Setup::default()).unwrap();
+    let dial_only = start_as(
+        [82; 32],
+        [0x92; 32],
+        Setup {
+            listen: false,
+            ..Setup::default()
+        },
+    )
+    .unwrap();
+    for node in [&reachable, &dial_only] {
+        reach(node, LP2P_REACH_UNKNOWN);
+        node.add_address(&server, &address);
+        node.bootstrap();
+    }
+
+    reach(&reachable, LP2P_REACH_PUBLIC);
+    reach(&dial_only, LP2P_REACH_PRIVATE);
+    let circuit = dial_only.wait_for(Duration::from_secs(10), |e| {
+        e.header.r#type == LP2P_EV_LISTENING && String::from_utf8_lossy(&e.data).contains("/p2p-circuit")
+    });
+    // Reserved on a relay among its peers: the server, or the node AutoNAT found public, which
+    // relays as well.
+    assert!(String::from_utf8_lossy(&circuit.data).starts_with("/ip4/127.0.0.1/tcp/"));
+
+    // A configured node keeps what it was told: the server reports its reachability once.
+    reach(&server, LP2P_REACH_PUBLIC);
+    let later = server.wait_until(Duration::from_secs(3), |e| {
+        e.header.r#type == LP2P_EV_REACHABILITY
+    });
+    assert!(later.is_none(), "a PUBLIC node changed its reachability");
+
+    for node in [server, reachable, dial_only] {
+        node.shutdown();
+    }
 }

@@ -159,6 +159,7 @@ unsafe fn config_from(o: &lp2p_options) -> Result<Config, i32> {
         rpc_timeout: Duration::from_millis(o.rpc_timeout_ms as u64),
         quic: o.quic != 0,
         dcutr: o.dcutr != 0,
+        autonat: o.autonat != 0,
         reachability: match o.reachability {
             LP2P_REACH_PRIVATE => Reachability::Private,
             LP2P_REACH_PUBLIC => Reachability::Public,

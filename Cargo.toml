@@ -19,6 +19,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 # Pinned exactly: the module is released rarely and a network runs old releases for years, so a
 # libp2p version is raised deliberately, with the interop tests green -- never by a lockfile update.
 libp2p = { version = "=0.56.0", default-features = false, features = [
+    "autonat",
     "dcutr",
     "ed25519",
     "gossipsub",
@@ -36,6 +37,11 @@ libp2p = { version = "=0.56.0", default-features = false, features = [
 async-trait = "0.1"
 futures = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[features]
+# Only for the tests: AutoNAT then accepts loopback addresses and probes within seconds instead of
+# minutes. A release is never built with it -- scripts/localize.sh builds without features.
+test-loopback = []
 
 [profile.release]
 # Measured: fat LTO and opt-level "s" take the module from 7.05 MB to 4.06 MB with no measurable
