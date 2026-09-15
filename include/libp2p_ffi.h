@@ -150,8 +150,11 @@ typedef struct lp2p_options {
 #define LP2P_EV_ANNOUNCEMENT 8    /* group, node; data: payload. New or not is the caller's call */
 #define LP2P_EV_PEER_DISCOVERED 9 /* id of the walk, node; data: multiaddrs, NUL-separated */
 #define LP2P_EV_DHT_RESULT 10     /* id; flags: LP2P_EVF_LAST ends the query */
-#define LP2P_EV_LIMITED 11        /* node, protocol: a limit refused a request */
-#define LP2P_EV_OVERFLOW 12       /* id: how many events were dropped */
+#define LP2P_EV_LIMITED                                                                            \
+    11                      /* group, node, protocol, reason: the LP2P_SCOPE_* that refused
+                                     a request, or LP2P_LIMITED_BLOCKED. At most ten per second;
+                                     lp2p_stats.rpc_limited counts all of them */
+#define LP2P_EV_OVERFLOW 12 /* id: how many events were dropped */
 
 #define LP2P_EVF_LAST 1u
 
@@ -178,11 +181,14 @@ typedef struct lp2p_event {
     uint32_t data_len; /* data follows this header */
 } lp2p_event;
 
-#define LP2P_CLASS_UNKNOWN 0
+/* Peer classes. A class belongs to a group -- every node of a group is in the group's class --
+ * and the numbers between these two mean whatever the caller decides. */
+#define LP2P_CLASS_UNKNOWN 0 /* every group nobody classified */
 #define LP2P_CLASS_BLOCKED 255
+#define LP2P_LIMITED_BLOCKED 255 /* the reason of an LP2P_EV_LIMITED for a blocked group */
 
 #define LP2P_SCOPE_PEER 0
-#define LP2P_SCOPE_IP_PREFIX 1 /* IPv4 /24, IPv6 /56 */
+#define LP2P_SCOPE_IP_PREFIX 1 /* IPv4 /24, IPv6 /56; not applied to relayed connections */
 #define LP2P_SCOPE_GLOBAL 2
 
 #define LP2P_PROTOCOL_ANY 0xffff
@@ -239,11 +245,27 @@ int32_t lp2p_rpc_respond(lp2p *node, uint64_t request_id, const uint8_t *data, s
 /** Closes the request's stream without an answer; the caller's failover moves on at once. */
 int32_t lp2p_rpc_reject(lp2p *node, uint64_t request_id);
 
-/** Policy from outside. Not implemented in this release: all three answer
- * LP2P_ERR_UNAVAILABLE. */
+/** Policy from outside. */
+
+/** Puts @p group in @p peer_class; LP2P_CLASS_UNKNOWN takes it out again. Applies to requests
+ * that arrive from then on. */
 int32_t lp2p_peer_set_class(lp2p *node, const lp2p_key group, uint8_t peer_class);
+
+/**
+ * Sets the limit for one class, one scope and one protocol index or LP2P_PROTOCOL_ANY, replacing
+ * the one that was there; a rate with any zero field removes it. Without a limit a class is not
+ * limited. A request is handed to the caller only if every limit that matches it has a token
+ * left; otherwise it is refused -- the requester sees LP2P_FAIL_REFUSED -- and reported as
+ * LP2P_EV_LIMITED.
+ *
+ * The check happens when a request has arrived and its delegation is verified, which is when its
+ * group, and so its class, is known: the request has been read by then, bounded by
+ * rpc_max_request_bytes.
+ */
 int32_t lp2p_limit_set(lp2p *node, uint8_t peer_class, uint8_t scope, uint16_t protocol,
                        lp2p_rate rate);
+
+/** Not implemented in this release: answers LP2P_ERR_UNAVAILABLE. */
 int32_t lp2p_announce_set_payload(lp2p *node, const uint8_t *data, size_t len);
 
 /** The network. */

@@ -339,13 +339,14 @@ pub unsafe extern "C" fn lp2p_rpc_reject(node: *mut lp2p, request_id: u64) -> i3
 /// `node` is a live handle and `group` 32 readable bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lp2p_peer_set_class(node: *mut lp2p, group: *const u8, peer_class: u8) -> i32 {
-    let _ = peer_class;
     guard(|| {
         status((|| {
-            unsafe { handle(node)? };
-            unsafe { key(group)? };
-            // Peer classes arrive with rate limiting.
-            Ok(LP2P_ERR_UNAVAILABLE)
+            let node = unsafe { handle(node)? };
+            let group = unsafe { key(group)? };
+            Ok(node.send(Command::SetClass {
+                group,
+                class: peer_class,
+            }))
         })())
     })
 }
@@ -360,14 +361,21 @@ pub unsafe extern "C" fn lp2p_limit_set(
     protocol: u16,
     rate: lp2p_rate,
 ) -> i32 {
-    let _ = (peer_class, protocol, rate);
     guard(|| {
         status((|| {
-            unsafe { handle(node)? };
-            if scope > LP2P_SCOPE_GLOBAL {
+            let node = unsafe { handle(node)? };
+            if scope > LP2P_SCOPE_GLOBAL
+                || peer_class == LP2P_CLASS_BLOCKED
+                || (protocol != LP2P_PROTOCOL_ANY && protocol as usize >= node.rpc_protocol_count)
+            {
                 return Err(LP2P_ERR_INVALID_ARGUMENT);
             }
-            Ok(LP2P_ERR_UNAVAILABLE)
+            Ok(node.send(Command::SetLimit {
+                class: peer_class,
+                scope,
+                protocol,
+                rate,
+            }))
         })())
     })
 }
@@ -504,7 +512,7 @@ pub unsafe extern "C" fn lp2p_stats_get(node: *const lp2p, out: *mut lp2p_stats)
                 reserved: 0,
                 rpc_in: shared.rpc_in.load(Ordering::Relaxed),
                 rpc_out: shared.rpc_out.load(Ordering::Relaxed),
-                rpc_limited: 0,
+                rpc_limited: shared.rpc_limited.load(Ordering::Relaxed),
                 events_dropped: shared.events.dropped(),
             };
             let known = size.min(std::mem::size_of::<lp2p_stats>());

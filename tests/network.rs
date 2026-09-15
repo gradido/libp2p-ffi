@@ -423,3 +423,113 @@ fn a_private_node_is_called_through_a_relay_alone() {
 fn a_private_node_is_called_through_a_relay_with_hole_punching() {
     a_private_node_is_called_through_a_relay(1, 50);
 }
+
+/// Calls @p server from @p caller, pinned, answering on the server side in between. Answers the
+/// caller's outcome and every LP2P_EV_LIMITED the server reported meanwhile.
+fn call_and_serve(caller: &TestNode, server: &TestNode, payload: &[u8]) -> (Event, Vec<Event>) {
+    let id = caller.request(&server.group, Some(&server.key), 0, payload);
+    let mut limited = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        for event in server.poll(20) {
+            match event.header.r#type {
+                LP2P_EV_RPC_REQUEST => unsafe {
+                    lp2p_rpc_respond(server.handle, event.header.id, b"ok".as_ptr(), 2);
+                },
+                LP2P_EV_LIMITED => limited.push(event),
+                _ => {}
+            }
+        }
+        for event in caller.poll(20) {
+            let kind = event.header.r#type;
+            if (kind == LP2P_EV_RPC_RESPONSE || kind == LP2P_EV_RPC_FAILED) && event.header.id == id {
+                return (event, limited);
+            }
+        }
+    }
+    panic!("no outcome for call {id}");
+}
+
+#[test]
+fn limits_apply_per_class_and_a_blocked_group_is_refused() {
+    let server = start([60; 32], [0xf0; 32]).unwrap();
+    let caller = start([61; 32], [0xf1; 32]).unwrap();
+    let address = server.listen_address();
+    caller.add_address(&server, &address);
+
+    // Two calls per minute per node, for groups nobody classified.
+    let per_minute = lp2p_rate {
+        amount: 1,
+        interval_ms: 60_000,
+        burst: 2,
+    };
+    assert_eq!(
+        unsafe {
+            lp2p_limit_set(
+                server.handle,
+                LP2P_CLASS_UNKNOWN,
+                LP2P_SCOPE_PEER,
+                LP2P_PROTOCOL_ANY,
+                per_minute,
+            )
+        },
+        LP2P_OK
+    );
+    for round in 0..2 {
+        let (outcome, limited) = call_and_serve(&caller, &server, b"within");
+        assert_eq!(outcome.header.r#type, LP2P_EV_RPC_RESPONSE, "round {round}");
+        assert!(limited.is_empty());
+    }
+    let (outcome, limited) = call_and_serve(&caller, &server, b"over");
+    assert_eq!(outcome.header.r#type, LP2P_EV_RPC_FAILED);
+    assert_eq!(outcome.header.reason, LP2P_FAIL_REFUSED);
+    assert_eq!(limited.len(), 1);
+    assert_eq!(limited[0].header.reason, LP2P_SCOPE_PEER as u16);
+    assert_eq!(limited[0].header.node, caller.key);
+    assert_eq!(limited[0].header.group, caller.group);
+
+    // The caller's group in a class of its own, which has no limit: it gets through again.
+    assert_eq!(
+        unsafe { lp2p_peer_set_class(server.handle, caller.group.as_ptr(), 7) },
+        LP2P_OK
+    );
+    let (outcome, _) = call_and_serve(&caller, &server, b"classified");
+    assert_eq!(outcome.header.r#type, LP2P_EV_RPC_RESPONSE);
+
+    // Blocked: refused whatever the limits say.
+    assert_eq!(
+        unsafe { lp2p_peer_set_class(server.handle, caller.group.as_ptr(), LP2P_CLASS_BLOCKED) },
+        LP2P_OK
+    );
+    let (outcome, limited) = call_and_serve(&caller, &server, b"blocked");
+    assert_eq!(outcome.header.r#type, LP2P_EV_RPC_FAILED);
+    assert_eq!(limited.len(), 1);
+    assert_eq!(limited[0].header.reason, LP2P_LIMITED_BLOCKED);
+
+    // A limit for the blocked class, or for a protocol the node does not have, is refused.
+    assert_eq!(
+        unsafe {
+            lp2p_limit_set(
+                server.handle,
+                LP2P_CLASS_BLOCKED,
+                LP2P_SCOPE_PEER,
+                LP2P_PROTOCOL_ANY,
+                per_minute,
+            )
+        },
+        LP2P_ERR_INVALID_ARGUMENT
+    );
+    assert_eq!(
+        unsafe { lp2p_limit_set(server.handle, 7, LP2P_SCOPE_PEER, 9, per_minute) },
+        LP2P_ERR_INVALID_ARGUMENT
+    );
+
+    let mut stats = lp2p_stats {
+        size: std::mem::size_of::<lp2p_stats>() as u32,
+        ..Default::default()
+    };
+    assert_eq!(unsafe { lp2p_stats_get(server.handle, &mut stats) }, LP2P_OK);
+    assert_eq!(stats.rpc_limited, 2);
+    server.shutdown();
+    caller.shutdown();
+}

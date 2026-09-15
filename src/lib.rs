@@ -16,5 +16,6 @@ mod events;
 #[allow(unsafe_code)]
 pub mod ffi;
 mod keys;
+mod limits;
 mod node;
 mod wire;

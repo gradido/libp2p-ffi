@@ -117,6 +117,9 @@ fn rust_and_c_agree_on_every_layout() {
             offset_of!(lp2p_stats, events_dropped),
         ),
         ("value.LP2P_DELEGATION_BYTES", LP2P_DELEGATION_BYTES),
+        ("value.LP2P_CLASS_BLOCKED", LP2P_CLASS_BLOCKED as usize),
+        ("value.LP2P_LIMITED_BLOCKED", LP2P_LIMITED_BLOCKED as usize),
+        ("value.LP2P_PROTOCOL_ANY", LP2P_PROTOCOL_ANY as usize),
         ("value.LP2P_ABI_VERSION", LP2P_ABI_VERSION as usize),
     ];
     assert_eq!(

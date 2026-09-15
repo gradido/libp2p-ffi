@@ -41,6 +41,9 @@ int main(void)
     OFF(lp2p_stats, rpc_in);
     OFF(lp2p_stats, events_dropped);
     printf("value.LP2P_DELEGATION_BYTES %d\n", LP2P_DELEGATION_BYTES);
+    printf("value.LP2P_CLASS_BLOCKED %d\n", LP2P_CLASS_BLOCKED);
+    printf("value.LP2P_LIMITED_BLOCKED %d\n", LP2P_LIMITED_BLOCKED);
+    printf("value.LP2P_PROTOCOL_ANY %d\n", LP2P_PROTOCOL_ANY);
     printf("value.LP2P_ABI_VERSION %d\n", LP2P_ABI_VERSION);
     return 0;
 }

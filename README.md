@@ -29,7 +29,7 @@ community and a node one of its instances.
 | DCUtR: a relayed connection is upgraded by hole punching | wired, **not working yet**: on loopback the attempt fails with `NoAddresses` because the calling side has no observed-address candidate. Calls still succeed over the relay. Needs a look with a real NAT |
 | connection limits: total, per peer, pending incoming | done |
 | AutoNAT | not yet — `reachability` is configured; UNKNOWN behaves as PUBLIC |
-| peer classes and rate limits | not yet — the calls answer `LP2P_ERR_UNAVAILABLE` |
+| peer classes per group, blocked groups, token-bucket limits per class, scope (peer, IP prefix, global) and protocol | done — checked once a request and its delegation have arrived |
 | announcement over gossipsub | not yet — the call answers `LP2P_ERR_UNAVAILABLE` |
 | interop test against js-libp2p | not yet |
 
@@ -44,11 +44,13 @@ src/delegation.rs      "node X belongs to group Y until T", signed by the group 
 src/events.rs          the bounded event queue and the record format
 src/address_book.rs    addresses of peers the routing table does not hold
 src/keys.rs            32-byte ed25519 keys <-> peer ids
+src/limits.rs          peer classes and token buckets
 scripts/localize.sh    release build -> dist/<target>/libp2p_ffi.o, .h, SHA256SUMS
 scripts/c-smoke.sh     links tests/c/smoke.c against that object with cc and zig cc
 tests/abi_layout.rs    the C compiler's layout of the header against the Rust one
 tests/network.rs       nodes on loopback, driven through the C interface: group calls with
-                       failover, a private node reached through a relay, with and without DCUtR
+                       failover, a private node reached through a relay, with and without DCUtR,
+                       limits per class and a blocked group
 ```
 
 ## Build and test

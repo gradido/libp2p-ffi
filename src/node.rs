@@ -18,7 +18,7 @@ use libp2p::kad::{self, store::MemoryStore};
 use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{self, InboundRequestId, OutboundRequestId, ProtocolSupport, ResponseChannel};
 use libp2p::swarm::behaviour::toggle::Toggle;
-use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
+use libp2p::swarm::{ConnectionId, NetworkBehaviour, SwarmEvent};
 use libp2p::{
     Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, connection_limits, dcutr, identify, noise, relay,
     tcp, yamux,
@@ -30,6 +30,7 @@ use crate::address_book::AddressBook;
 use crate::delegation::{Delegation, now_ms};
 use crate::events::{EventBuilder, EventQueue, Record};
 use crate::keys;
+use crate::limits::{self, Limits};
 use crate::wire::{self, RPC_PROTOCOL, RawCodec};
 
 /// How long a provider record is re-published at most once. A burst of new peers after start
@@ -121,6 +122,16 @@ pub enum Command {
     RandomWalk {
         id: u64,
     },
+    SetClass {
+        group: lp2p_key,
+        class: u8,
+    },
+    SetLimit {
+        class: u8,
+        scope: u8,
+        protocol: u16,
+        rate: lp2p_rate,
+    },
     RoutingSample {
         max: usize,
         reply: std::sync::mpsc::Sender<Vec<Record>>,
@@ -136,6 +147,7 @@ pub struct Shared {
     pub routing_table_peers: AtomicU32,
     pub rpc_in: AtomicU64,
     pub rpc_out: AtomicU64,
+    pub rpc_limited: AtomicU64,
     pub poisoned: AtomicBool,
 }
 
@@ -166,6 +178,7 @@ impl Node {
             routing_table_peers: AtomicU32::new(0),
             rpc_in: AtomicU64::new(0),
             rpc_out: AtomicU64::new(0),
+            rpc_limited: AtomicU64::new(0),
             poisoned: AtomicBool::new(false),
         });
         let rpc_protocol_count = config.rpc_protocols.len();
@@ -449,6 +462,10 @@ struct State {
     relay_failed: HashMap<PeerId, Instant>,
     /// The address each connected peer was dialed on, for the peers this node dialed.
     dialed: HashMap<PeerId, Multiaddr>,
+    /// The remote address of every open connection, for the IP prefix a request came from.
+    connections: HashMap<ConnectionId, Multiaddr>,
+    limits: Limits,
+    last_sweep: Instant,
 }
 
 /// Queues @p peer for @p call: the group's last good node first, recently failed nodes last, the
@@ -534,6 +551,9 @@ impl State {
             reservations: HashMap::new(),
             relay_failed: HashMap::new(),
             dialed: HashMap::new(),
+            connections: HashMap::new(),
+            limits: Limits::default(),
+            last_sweep: Instant::now(),
         }
     }
 
@@ -646,6 +666,13 @@ impl State {
             Command::RoutingSample { max, reply } => {
                 let _ = reply.send(self.routing_sample(swarm, max));
             }
+            Command::SetClass { group, class } => self.limits.set_class(group, class),
+            Command::SetLimit {
+                class,
+                scope,
+                protocol,
+                rate,
+            } => self.limits.set_limit(class, scope, protocol, rate),
             Command::Shutdown => {}
         }
     }
@@ -714,6 +741,10 @@ impl State {
             }
         }
         self.reserve(swarm);
+        if now.duration_since(self.last_sweep) >= Duration::from_secs(10) {
+            self.limits.sweep(now);
+            self.last_sweep = now;
+        }
         if self.provide_due
             && self
                 .last_provide
@@ -855,10 +886,16 @@ impl State {
             SwarmEvent::ListenerError { listener_id, .. } => self.relay_lost(listener_id),
             SwarmEvent::ConnectionEstablished {
                 peer_id,
+                connection_id,
                 num_established,
                 endpoint,
                 ..
             } => {
+                let remote = match &endpoint {
+                    libp2p::core::ConnectedPoint::Dialer { address, .. } => address,
+                    libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr,
+                };
+                self.connections.insert(connection_id, remote.clone());
                 if endpoint.is_dialer() && !is_relayed(endpoint.get_remote_address()) {
                     self.dialed.insert(peer_id, endpoint.get_remote_address().clone());
                 }
@@ -876,9 +913,11 @@ impl State {
             }
             SwarmEvent::ConnectionClosed {
                 peer_id,
+                connection_id,
                 num_established,
                 ..
             } => {
+                self.connections.remove(&connection_id);
                 if num_established == 0 {
                     self.dialed.remove(&peer_id);
                     self.emit(
@@ -993,12 +1032,16 @@ impl State {
 
     fn rpc_event(&mut self, swarm: &mut Swarm<Behaviour>, event: request_response::Event<Vec<u8>, Vec<u8>>) {
         match event {
-            request_response::Event::Message { peer, message, .. } => match message {
+            request_response::Event::Message {
+                peer,
+                connection_id,
+                message,
+            } => match message {
                 request_response::Message::Request {
                     request_id,
                     request,
                     channel,
-                } => self.inbound_request(peer, request_id, &request, channel),
+                } => self.inbound_request(peer, connection_id, request_id, &request, channel),
                 request_response::Message::Response { request_id, response } => {
                     self.response(swarm, peer, request_id, &response)
                 }
@@ -1035,6 +1078,7 @@ impl State {
     fn inbound_request(
         &mut self,
         peer: PeerId,
+        connection: ConnectionId,
         request_id: InboundRequestId,
         frame: &[u8],
         channel: ResponseChannel<Vec<u8>>,
@@ -1056,6 +1100,43 @@ impl State {
         let Some(protocol) = self.rpc_protocols.iter().position(|p| p == request.protocol) else {
             return;
         };
+        // A relayed connection shows the relay's address, which would put every peer behind that
+        // relay into one prefix; it is limited per peer and globally only.
+        let ip = self
+            .connections
+            .get(&connection)
+            .filter(|address| !is_relayed(address))
+            .and_then(|address| {
+                address.iter().find_map(|p| match p {
+                    Protocol::Ip4(ip) => Some(std::net::IpAddr::V4(ip)),
+                    Protocol::Ip6(ip) => Some(std::net::IpAddr::V6(ip)),
+                    _ => None,
+                })
+            });
+        let now = Instant::now();
+        let admitted = self.limits.check(
+            &limits::Request {
+                group: &delegation.group,
+                peer,
+                ip,
+                protocol: protocol as u16,
+            },
+            now,
+        );
+        if let Err(reason) = admitted {
+            self.shared.rpc_limited.fetch_add(1, Ordering::Relaxed);
+            if self.limits.may_report(now) {
+                self.emit(
+                    EventBuilder::new(LP2P_EV_LIMITED)
+                        .group(delegation.group)
+                        .node(node)
+                        .protocol(protocol as u16)
+                        .reason(reason)
+                        .build(),
+                );
+            }
+            return;
+        }
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
         self.shared.rpc_in.fetch_add(1, Ordering::Relaxed);
         self.emit(

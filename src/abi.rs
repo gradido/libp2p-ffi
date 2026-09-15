@@ -121,6 +121,12 @@ pub struct lp2p_event {
 pub const LP2P_EVENT_HEADER_BYTES: usize = std::mem::size_of::<lp2p_event>();
 const _: () = assert!(LP2P_EVENT_HEADER_BYTES == 88);
 
+pub const LP2P_CLASS_UNKNOWN: u8 = 0;
+pub const LP2P_CLASS_BLOCKED: u8 = 255;
+pub const LP2P_PROTOCOL_ANY: u16 = 0xffff;
+/// The reason an LP2P_EV_LIMITED carries when the class is LP2P_CLASS_BLOCKED rather than a scope.
+pub const LP2P_LIMITED_BLOCKED: u16 = 255;
+
 pub const LP2P_SCOPE_PEER: u8 = 0;
 pub const LP2P_SCOPE_IP_PREFIX: u8 = 1;
 pub const LP2P_SCOPE_GLOBAL: u8 = 2;
