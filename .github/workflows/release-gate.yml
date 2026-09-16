@@ -1,0 +1,32 @@
+# Answers one question on every pull request: would merging this publish a release, and is it
+# allowed to? The rule itself is scripts/release-version.sh, so this workflow and the one that
+# publishes cannot drift apart.
+#
+# A pull request whose title says "release" fails here unless the Cargo.toml version is higher
+# than the base branch's and higher than every tag. One that does not say it passes, with a note
+# when the version moved anyway -- a bump that publishes nothing is worth seeing before the merge,
+# not after.
+name: release gate
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The whole history and every tag: the rule compares against both.
+          fetch-depth: 0
+      - name: check the version against the title
+        # Through the environment, never interpolated into the script: a pull request title is
+        # written by whoever opens it.
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: scripts/release-version.sh check "$PR_TITLE" "$BASE_SHA"

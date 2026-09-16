@@ -1,0 +1,150 @@
+# Builds the prebuilt module for every platform and publishes it as a release.
+#
+# It runs when a pull request whose title says "release" is merged and its version is higher than
+# the base branch's and than every tag -- the same check the release gate already ran on the open
+# pull request, run again here because a title can be edited after a green check.
+#
+# What it publishes, per target: libp2p_ffi.o (ELF, Mach-O) or libp2p_ffi.lib (COFF), the header,
+# NATIVE_LIBS.txt with the libraries the caller's link line needs, and SHA256SUMS -- in one
+# archive per target, with a SHA256SUMS over the archives beside them. A consumer pins a version
+# and a hash; see gradido2's fast-servers/dht-node/Architecture.md, *Getting it*.
+name: prebuild
+
+on:
+  pull_request:
+    types: [closed]
+  # For a release that has to be rebuilt without another pull request. The version rules still
+  # apply: a version that is already tagged is refused.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: prebuild
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.check.outputs.publish }}
+      version: ${{ steps.check.outputs.version }}
+      sha: ${{ steps.check.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The merged branch, not the pull request's merge ref: what is released is what is on
+          # the branch, and every job below checks out exactly the commit resolved here.
+          ref: ${{ github.event.pull_request.base.ref || github.ref_name }}
+          fetch-depth: 0
+      - id: check
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -eu
+          echo "version=$(scripts/release-version.sh version)" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          if [ "$EVENT" = workflow_dispatch ]; then
+            # No base to compare against; the tag rules still hold.
+            scripts/release-version.sh check "release (manual run)" ""
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Fails the job when the title says release and the version does not back it up.
+          answer=$(scripts/release-version.sh check "$PR_TITLE" "$BASE_SHA")
+          echo "$answer"
+          case "$answer" in
+            release:*) echo "publish=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "publish=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+  build:
+    needs: gate
+    if: needs.gate.outputs.publish == 'true'
+    strategy:
+      # One platform failing must not hide what the others would have said.
+      fail-fast: false
+      matrix:
+        # Native runners for all six: a Rust build for macOS needs the Apple SDK and one for
+        # Windows the MSVC toolchain, so cross-compiling from Linux is not the cheaper road. The
+        # arm64 runners (ubuntu-22.04-arm, windows-11-arm) are free for public repositories; on a
+        # private one they are billed, and dropping those two rows leaves x64 working.
+        include:
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: macos-13, target: x86_64-apple-darwin }
+          - { os: macos-14, target: aarch64-apple-darwin }
+          - { os: windows-2022, target: x86_64-pc-windows-msvc, arch: x64 }
+          - { os: windows-11-arm, target: aarch64-pc-windows-msvc, arch: arm64 }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        # Git Bash on the Windows runners, so one script covers every platform.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+      # rust-toolchain.toml pins the compiler; this installs exactly that one.
+      - run: rustup show
+      - name: unit tests
+        run: cargo test --lib --release
+      - name: the whole suite, where the network tests are at home
+        if: startsWith(matrix.os, 'ubuntu')
+        run: cargo test --features test-loopback
+      - name: build the prebuild
+        run: scripts/localize.sh
+      - name: link it from C and run it
+        if: runner.os != 'Windows'
+        run: scripts/c-smoke.sh
+      - name: link it from C and run it
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set VSPATH=%%i
+          call "%VSPATH%\VC\Auxiliary\Build\vcvarsall.bat" ${{ matrix.arch }} || exit /b 1
+          set /p NATIVE_LIBS=<dist\host\NATIVE_LIBS.txt
+          cl /nologo /I dist\host tests\c\smoke.c dist\host\libp2p_ffi.lib %NATIVE_LIBS% /Fe:smoke.exe || exit /b 1
+          smoke.exe || exit /b 1
+      - name: package
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -eu
+          name="libp2p-ffi-$VERSION-$TARGET"
+          mv dist/host "dist/$name"
+          tar -czf "$name.tar.gz" -C dist "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: libp2p-ffi-*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: [gate, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+      - name: one list of hashes over the archives
+        run: cd release && sha256sum ./*.tar.gz > SHA256SUMS && cat SHA256SUMS
+      - name: tag and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.gate.outputs.version }}
+          SHA: ${{ needs.gate.outputs.sha }}
+        run: |
+          set -eu
+          gh release create "v$VERSION" release/*.tar.gz release/SHA256SUMS \
+            --target "$SHA" --title "v$VERSION" --generate-notes

@@ -48,7 +48,8 @@ src/events.rs          the bounded event queue and the record format
 src/address_book.rs    addresses of peers the routing table does not hold
 src/keys.rs            32-byte ed25519 keys <-> peer ids
 src/limits.rs          peer classes and token buckets
-scripts/localize.sh    release build -> dist/<target>/libp2p_ffi.o, .h, SHA256SUMS
+scripts/localize.sh    release build -> dist/<target>/ the object, .h, NATIVE_LIBS.txt, SHA256SUMS
+scripts/release-version.sh  what makes a merge a release, for the workflows and for a local check
 scripts/c-smoke.sh     links tests/c/smoke.c against that object with cc and zig cc
 examples/holepunch.rs  one node of the NAT test, by ROLE
 interop/holepunch/     two nodes behind NAT routers and a relay, in Docker
@@ -196,6 +197,33 @@ topic message  the same frame, on "/lp2p/topic/1/" + the 32-byte topic key in lo
                provided in the DHT under 0x12 0x20 || sha256(topic key), which is how the
                members of a small topic find each other
 ```
+
+## Releases
+
+A release is a pull request whose **title says "release"** and whose **`Cargo.toml` version is
+higher** than the base branch's and than every tag. Both conditions, because either alone
+publishes by accident: a title is typed by hand, and a version bump that only prepares the next
+round would release on its own. `scripts/release-version.sh` is the rule; `.github/workflows`
+runs it twice -- on the open pull request, so a missing bump is a red check rather than a
+surprise, and again at merge, because a title can be edited after a green one.
+
+What a merge then builds, on a native runner each, is one archive per target:
+
+```text
+x86_64-unknown-linux-gnu    aarch64-unknown-linux-gnu     libp2p_ffi.o
+x86_64-apple-darwin         aarch64-apple-darwin          libp2p_ffi.o
+x86_64-pc-windows-msvc      aarch64-pc-windows-msvc       libp2p_ffi.lib
+
+each archive holds  the object, libp2p_ffi.h, NATIVE_LIBS.txt (what the caller's link line
+                    needs, printed by rustc rather than written down), SHA256SUMS
+the release holds   the archives and one SHA256SUMS over them
+```
+
+Every job runs the unit tests, builds the artifact and links `tests/c/smoke.c` against it before
+anything is published; the Linux jobs run the whole suite. **Windows ships the staticlib**, not a
+localized object: MSVC's toolchain has no partial link. The clash that localization avoids is
+ELF's, so this is expected to be fine, and it is untested with a second Rust staticlib in one
+binary -- `scripts/localize.sh` says so at the point where it matters.
 
 ## License
 
