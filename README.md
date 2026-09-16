@@ -206,6 +206,10 @@ not been released before**: not tagged yet, after every tag, and -- when the tit
 safe. A version that is unchanged on the branch is fine and says so in the log: bumping in one
 pull request and releasing in another is ordinary, and a first release has nothing to bump from.
 
+[`CHANGELOG.md`](CHANGELOG.md) says per version what moved in the ABI, on the wire and in the
+build. The generated release notes list the pull requests; that file answers whether a caller
+still compiles and whether old nodes still understand the new ones.
+
 `scripts/release-version.sh` is that rule, and `.github/workflows` runs it twice -- on the open
 pull request, so a mismatch is a red check rather than a surprise, and again at merge, because a
 title can be edited after a green one. **Make the check required on the default branch**

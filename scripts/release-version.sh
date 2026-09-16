@@ -7,6 +7,10 @@
 #   scripts/release-version.sh check <title> <base>    exits 0 when the pull request is
 #                                                      consistent, non-zero with a reason when not
 #
+# `check` writes exactly one line to stdout -- "release: v<version>" or "not a release: <title>" --
+# and everything a human needs to read to stderr. A workflow decides on that one line, so a note
+# added here never changes what it decides.
+#
 # A release is a pull request whose title says "release" and whose Cargo.toml version has not been
 # released before. What is hard and what is a note:
 #
@@ -60,7 +64,7 @@ check)
     if ! printf '%s' "$title" | grep -qi 'release'; then
         if [ -n "$old" ] && [ "$old" != "$new" ]; then
             echo "note: the version moves $old -> $new, but the title does not say release," \
-                 "so merging this publishes nothing."
+                 "so merging this publishes nothing." >&2
         fi
         echo "not a release: '$title'"
         exit 0
@@ -84,10 +88,10 @@ check)
     fi
     if [ -n "$old" ] && [ "$old" = "$new" ]; then
         echo "note: the version is unchanged on this branch. Nothing has been released under" \
-             "v$new, so this is its first release."
+             "v$new, so this is its first release." >&2
     elif [ -n "$old" ] && higher "$old" "$new"; then
         echo "note: the version moves back, $old -> $new. No tag stands in the way, so it goes" \
-             "out -- but check that this is what you meant."
+             "out -- but check that this is what you meant." >&2
     fi
     echo "release: v$new${old:+ (was $old)}"
     ;;
