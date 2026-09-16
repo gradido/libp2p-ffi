@@ -175,9 +175,8 @@ fn main() {
                             say("ERROR usage".into());
                             continue;
                         };
-                        let status = unsafe {
-                            lp2p_topic_publish(node.0, topic.as_ptr(), text.as_ptr(), text.len())
-                        };
+                        let status =
+                            unsafe { lp2p_topic_publish(node.0, topic.as_ptr(), text.as_ptr(), text.len()) };
                         say(if status == LP2P_OK {
                             "OK".into()
                         } else {
