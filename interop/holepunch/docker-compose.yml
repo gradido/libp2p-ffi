@@ -1,10 +1,15 @@
-# Two nodes, each behind its own NAT router, and a relay on the network between the routers.
+# Nodes behind NAT routers, and a relay on the network between the routers.
 #
-#   lan-a 10.99.1.0/24          public 10.99.0.0/24          lan-b 10.99.2.0/24
+#   lan-a 10.99.1.0/24          public 11.99.0.0/24          lan-b 10.99.2.0/24
 #   dialer .10 -- router-a .2 | .11 -- relay .10 -- .12 | .2 router-b -- .10 listener
+#   client-nat .20 -/            client-public .13
 #
-# All three networks are internal: nothing reaches the host or the internet, and the nodes reach
-# each other only through the routers. run.sh drives it.
+# The "public" network is 11.99.0.0/24 rather than a private range on purpose: js-libp2p's DCUtR and
+# AutoNAT, and rust-libp2p's AutoNAT, ignore private addresses by design. All three networks are
+# internal, so nothing reaches the host or the internet whatever the range.
+#
+# Profiles: holepunch (dialer, listener) and autonat (client-public, client-nat). IMPL of each role
+# is rust or js, set by RELAY, DIALER, LISTENER and CLIENT. run.sh drives it.
 name: lp2p-holepunch
 
 x-node: &node
@@ -28,20 +33,24 @@ services:
     <<: *node
     environment:
       ROLE: relay
+      IMPL: ${RELAY:-rust}
       TRANSPORT: ${TRANSPORT:-tcp}
+      LP2P_TRACE: ${LP2P_TRACE:-}
+      DEBUG: ${DEBUG:-}
+      TRUST_OBSERVED: ${TRUST_OBSERVED:-}
     networks:
       public:
-        ipv4_address: 10.99.0.10
+        ipv4_address: 11.99.0.10
 
   router-a:
     <<: *router
     environment:
       NAT: ${NAT:-cone}
-      PUBLIC_PREFIX: "10.99.0."
+      PUBLIC_PREFIX: "11.99.0."
       LAN_PREFIX: "10.99.1."
     networks:
       public:
-        ipv4_address: 10.99.0.11
+        ipv4_address: 11.99.0.11
       lan-a:
         ipv4_address: 10.99.1.2
 
@@ -49,43 +58,84 @@ services:
     <<: *router
     environment:
       NAT: ${NAT:-cone}
-      PUBLIC_PREFIX: "10.99.0."
+      PUBLIC_PREFIX: "11.99.0."
       LAN_PREFIX: "10.99.2."
     networks:
       public:
-        ipv4_address: 10.99.0.12
+        ipv4_address: 11.99.0.12
       lan-b:
         ipv4_address: 10.99.2.2
 
   listener:
     <<: *node
+    profiles: [holepunch]
     depends_on: [relay, router-b]
     environment:
       ROLE: listener
+      IMPL: ${LISTENER:-rust}
       TRANSPORT: ${TRANSPORT:-tcp}
-      LP2P_TRACE: ${LP2P_TRACE:-}
       GATEWAY: 10.99.2.2
+      LP2P_TRACE: ${LP2P_TRACE:-}
+      DEBUG: ${DEBUG:-}
+      TRUST_OBSERVED: ${TRUST_OBSERVED:-}
     networks:
       lan-b:
         ipv4_address: 10.99.2.10
 
   dialer:
     <<: *node
+    profiles: [holepunch]
     depends_on: [listener, router-a]
     environment:
       ROLE: dialer
+      IMPL: ${DIALER:-rust}
       TRANSPORT: ${TRANSPORT:-tcp}
-      LP2P_TRACE: ${LP2P_TRACE:-}
       GATEWAY: 10.99.1.2
+      LP2P_TRACE: ${LP2P_TRACE:-}
+      DEBUG: ${DEBUG:-}
+      TRUST_OBSERVED: ${TRUST_OBSERVED:-}
     networks:
       lan-a:
         ipv4_address: 10.99.1.10
+
+  client-public:
+    <<: *node
+    profiles: [autonat]
+    depends_on: [relay]
+    environment:
+      ROLE: autonat-client
+      SEED: "5"
+      IMPL: ${CLIENT:-rust}
+      TRANSPORT: ${TRANSPORT:-tcp}
+      LP2P_TRACE: ${LP2P_TRACE:-}
+      DEBUG: ${DEBUG:-}
+      TRUST_OBSERVED: ${TRUST_OBSERVED:-}
+    networks:
+      public:
+        ipv4_address: 11.99.0.13
+
+  client-nat:
+    <<: *node
+    profiles: [autonat]
+    depends_on: [relay, router-a]
+    environment:
+      ROLE: autonat-client
+      SEED: "6"
+      IMPL: ${CLIENT:-rust}
+      TRANSPORT: ${TRANSPORT:-tcp}
+      GATEWAY: 10.99.1.2
+      LP2P_TRACE: ${LP2P_TRACE:-}
+      DEBUG: ${DEBUG:-}
+      TRUST_OBSERVED: ${TRUST_OBSERVED:-}
+    networks:
+      lan-a:
+        ipv4_address: 10.99.1.20
 
 networks:
   public:
     internal: true
     ipam:
-      config: [{ subnet: 10.99.0.0/24 }]
+      config: [{ subnet: 11.99.0.0/24 }]
   lan-a:
     internal: true
     ipam:

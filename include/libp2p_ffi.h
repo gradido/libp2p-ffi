@@ -135,6 +135,11 @@ typedef struct lp2p_options {
      *            they report, with LP2P_EV_REACHABILITY each time. Without autonat it stays
      *            PUBLIC. A configured PUBLIC or PRIVATE is never overridden. */
     uint8_t reachability;
+    /* Topics. A topic is 32 bytes the caller chooses -- a hash of whatever it names. The module
+     * turns it into a gossipsub topic and, while the node follows it, provides it in the DHT and
+     * looks it up there, so that members that never meet otherwise find each other. */
+    uint32_t topic_max_message_bytes; /* a larger message is not reported and not forwarded */
+    uint32_t topic_max_subscriptions; /* lp2p_topic_subscribe answers LP2P_ERR_LIMITED above it */
 } lp2p_options;
 
 /* Events. One record per event, whole records only, each followed by its data. */
@@ -162,6 +167,9 @@ typedef struct lp2p_options {
 /* node; reason 0: a relayed connection was upgraded to a direct one by hole punching, data: the
  * direct address. reason 1: the attempt failed and the connection stays relayed, data: why. */
 #define LP2P_EV_HOLE_PUNCH 13
+/* group, node of the publisher (delegation checked); data: the 32-byte topic key, then the
+ * payload. Only for topics this node subscribed to. */
+#define LP2P_EV_TOPIC_MESSAGE 14
 
 #define LP2P_EVF_LAST 1u
 
@@ -199,16 +207,23 @@ typedef struct lp2p_event {
 #define LP2P_SCOPE_GLOBAL 2
 
 #define LP2P_PROTOCOL_ANY 0xffff
+/* Names published messages rather than an RPC, for lp2p_limit_set and lp2p_limit_set_bytes. */
+#define LP2P_PROTOCOL_TOPICS 0xfffe
 
 typedef struct lp2p_stats {
     uint32_t size; /* set by the caller; the module fills what fits */
     uint32_t connections;
     uint32_t routing_table_peers;
-    uint32_t reserved;
+    uint32_t topics_subscribed;
     uint64_t rpc_in;
     uint64_t rpc_out;
     uint64_t rpc_limited;
     uint64_t events_dropped;
+    uint64_t topic_in;        /* messages reported to the caller */
+    uint64_t topic_out;       /* messages this node published */
+    uint64_t topic_bytes_in;  /* on the wire, frame included */
+    uint64_t topic_bytes_out;
+    uint64_t topic_limited;   /* messages a limit or a blocked group stopped */
 } lp2p_stats;
 
 uint32_t lp2p_abi_version(void);
@@ -275,6 +290,19 @@ int32_t lp2p_limit_set(lp2p *node, uint8_t peer_class, uint8_t scope, uint16_t p
                        lp2p_rate rate);
 
 /**
+ * The same, counted in bytes instead of requests: a message costs its size on the wire. Both
+ * limits can hold for the same class, scope and protocol at once -- one caps how often, the other
+ * how much -- and a message passes only if both have room. This is what sizes a mirror's traffic
+ * to its hardware: a node with a small uplink gives the classes it serves a byte rate it can
+ * carry, and the rest is not forwarded.
+ *
+ * For LP2P_PROTOCOL_TOPICS the limit is counted against the peer that passed the message on --
+ * that is the connection this node can stop -- while the class is the publisher's.
+ */
+int32_t lp2p_limit_set_bytes(lp2p *node, uint8_t peer_class, uint8_t scope, uint16_t protocol,
+                             lp2p_rate rate);
+
+/**
  * Sets what this node announces, and announces it when it differs from what was announced last.
  * Without a subscribed peer the announcement waits and goes out as soon as one appears. A node
  * announces nothing until the caller sets a payload, typically right after lp2p_start.
@@ -283,11 +311,44 @@ int32_t lp2p_limit_set(lp2p *node, uint8_t peer_class, uint8_t scope, uint16_t p
  */
 int32_t lp2p_announce_set_payload(lp2p *node, const uint8_t *data, size_t len);
 
+/** Topics: what several nodes read at once, without any of them asking.
+ *
+ * A topic key is 32 bytes the caller derives from what the topic is about -- one community, one
+ * shard of them, one kind of notice. The module keeps no meaning of its own in it.
+ *
+ * Subscribing does three things: it follows the topic, it provides the key in the DHT, and it
+ * looks the key up there and dials a few of the nodes it finds. That last part is what makes a
+ * topic with a handful of members work at all: gossipsub forwards between peers that are already
+ * connected and never dials to find more. While a topic has no peer, the lookup is repeated every
+ * thirty seconds.
+ *
+ * Every message carries this node's delegation, and a receiver reports it only after checking it,
+ * so a message names the group that published it. Delivery is best effort and unordered, like
+ * every gossip protocol: a publication with no peer yet on the topic reaches nobody and is not
+ * repeated. What has to arrive is an RPC, not a message.
+ */
+int32_t lp2p_topic_subscribe(lp2p *node, const lp2p_key topic_key);
+int32_t lp2p_topic_unsubscribe(lp2p *node, const lp2p_key topic_key);
+/** Publishes into a topic this node subscribed to; into any other it is dropped.
+ * LP2P_ERR_INVALID_ARGUMENT above topic_max_message_bytes. */
+int32_t lp2p_topic_publish(lp2p *node, const lp2p_key topic_key, const uint8_t *data, size_t len);
+/** How many peers this node currently forwards the topic to, or a negative status. 0 means a
+ * publication would reach nobody yet. */
+int32_t lp2p_topic_peers(const lp2p *node, const lp2p_key topic_key);
+
 /** The network. */
 int32_t lp2p_add_address(lp2p *node, const lp2p_key node_key, const char *multiaddr);
 int32_t lp2p_dht_bootstrap(lp2p *node, uint64_t *query_id);
 /** Optional, and only when the caller asks: every peer the walk meets is reported. */
 int32_t lp2p_dht_random_walk(lp2p *node, uint64_t *query_id);
+/** Provider records under a key of the caller's choosing, the same way a group is found: "this
+ * node has something to do with this key". A subscribed topic is provided already; this is for
+ * everything else the caller wants to be findable by, and for finding those nodes.
+ * lp2p_dht_find_providers reports each provider as LP2P_EV_PEER_DISCOVERED with the query's id
+ * and ends with LP2P_EV_DHT_RESULT. */
+int32_t lp2p_dht_provide(lp2p *node, const lp2p_key record_key);
+int32_t lp2p_dht_stop_providing(lp2p *node, const lp2p_key record_key);
+int32_t lp2p_dht_find_providers(lp2p *node, const lp2p_key record_key, uint64_t *query_id);
 /** A sample of the routing table for a bootstrap answer: event records, as lp2p_poll writes. */
 int32_t lp2p_routing_sample(lp2p *node, uint8_t *buf, size_t cap, uint32_t max_peers);
 /** Fills as much of @p out as out->size says the caller knows. */

@@ -27,6 +27,7 @@ libp2p = { version = "=0.56.0", default-features = false, features = [
     "kad",
     "macros",
     "noise",
+    "ping",
     "quic",
     "relay",
     "request-response",
@@ -35,6 +36,8 @@ libp2p = { version = "=0.56.0", default-features = false, features = [
     "yamux",
 ] }
 async-trait = "0.1"
+# The provider key is a sha2-256 multihash, so that a js-libp2p DHT can name it as a CID.
+sha2 = "0.10"
 futures = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 

@@ -1,12 +1,14 @@
 //! One node of the hole-punching test in `interop/holepunch`, driven through the C interface.
 //!
 //! ```text
-//! ROLE=relay      PUBLIC, relays for the two others
+//! ROLE=relay      PUBLIC, relays for the others and answers their AutoNAT probes
 //! ROLE=listener   PRIVATE behind NAT b: reserves on the relay, answers every call with "pong"
 //! ROLE=dialer     PRIVATE behind NAT a: calls the listener through the relay, waits for DCUtR
 //!                 to upgrade the connection, calls again, prints one RESULT line and exits
 //!                 0 hole punched, 1 still relayed (the listener logs why), 2 no answer at all
-//! TRANSPORT=tcp|quic   RELAY_IP=10.99.0.10
+//! ROLE=autonat-client   UNKNOWN: connects to the relay and lets AutoNAT decide, prints one
+//!                 RESULT line and exits 0 public, 1 private, 2 no verdict within a minute
+//! TRANSPORT=tcp|quic   RELAY_IP=11.99.0.10   SEED=<byte> for an autonat client
 //! ```
 //!
 //! Keys come from fixed seeds, so every role knows every other role's peer id without talking.
@@ -59,7 +61,7 @@ fn addresses(transport: &str, ip: &str) -> String {
     }
 }
 
-fn start(seed: [u8; 32], group_seed: [u8; 32], reachability: u8, transport: &str) -> Node {
+fn start(seed: [u8; 32], group_seed: [u8; 32], reachability: u8, transport: &str, autonat: bool) -> Node {
     let key = key_of(seed);
     let mut delegation = [0u8; LP2P_DELEGATION_BYTES];
     assert_eq!(
@@ -86,7 +88,7 @@ fn start(seed: [u8; 32], group_seed: [u8; 32], reachability: u8, transport: &str
     options.rpc_protocol_count = 1;
     options.quic = u8::from(transport == "quic");
     options.dcutr = 1;
-    options.autonat = 0;
+    options.autonat = u8::from(autonat);
     options.announce.enabled = 0;
     options.reachability = reachability;
 
@@ -150,6 +152,7 @@ fn describe(event: &Event) -> Option<String> {
         LP2P_EV_HOLE_PUNCH if event.header.reason == 0 => Some(format!("hole punched, direct {data}")),
         LP2P_EV_HOLE_PUNCH => Some(format!("hole punch failed: {data}")),
         LP2P_EV_RPC_FAILED => Some(format!("call failed, reason {}", event.header.reason)),
+        LP2P_EV_REACHABILITY => Some(format!("reachability {}", event.header.reason)),
         _ => None,
     }
 }
@@ -166,7 +169,7 @@ fn main() {
     }
     let role = std::env::var("ROLE").unwrap_or_else(|_| "dialer".into());
     let transport = std::env::var("TRANSPORT").unwrap_or_else(|_| "tcp".into());
-    let relay_ip = std::env::var("RELAY_IP").unwrap_or_else(|_| "10.99.0.10".into());
+    let relay_ip = std::env::var("RELAY_IP").unwrap_or_else(|_| "11.99.0.10".into());
     let (relay_seed, listener_seed, dialer_seed) = ([1u8; 32], [2u8; 32], [3u8; 32]);
     let (relay_group, listener_group, dialer_group) = ([0x11u8; 32], [0x22u8; 32], [0x33u8; 32]);
     let relay_key = key_of(relay_seed);
@@ -174,7 +177,7 @@ fn main() {
 
     match role.as_str() {
         "relay" => {
-            let node = start(relay_seed, relay_group, LP2P_REACH_PUBLIC, &transport);
+            let node = start(relay_seed, relay_group, LP2P_REACH_PUBLIC, &transport, true);
             say(&role, format!("peer {}", peer_id(&node.key)));
             loop {
                 for event in node.poll(1000) {
@@ -185,7 +188,13 @@ fn main() {
             }
         }
         "listener" => {
-            let node = start(listener_seed, listener_group, LP2P_REACH_PRIVATE, &transport);
+            let node = start(
+                listener_seed,
+                listener_group,
+                LP2P_REACH_PRIVATE,
+                &transport,
+                false,
+            );
             node.add_address(&relay_key, &relay_address);
             let mut id = 0;
             unsafe { lp2p_dht_bootstrap(node.handle, &mut id) };
@@ -200,8 +209,49 @@ fn main() {
                 }
             }
         }
+        "autonat-client" => {
+            let seed = std::env::var("SEED")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4u8);
+            let node = start(
+                [seed; 32],
+                [seed.wrapping_add(0x40); 32],
+                LP2P_REACH_UNKNOWN,
+                &transport,
+                true,
+            );
+            node.add_address(&relay_key, &relay_address);
+            let mut id = 0;
+            unsafe { lp2p_dht_bootstrap(node.handle, &mut id) };
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let mut verdict = None;
+            while verdict.is_none() && Instant::now() < deadline {
+                for event in node.poll(500) {
+                    if let Some(line) = describe(&event) {
+                        say(&role, line);
+                    }
+                    if event.header.r#type == LP2P_EV_REACHABILITY
+                        && event.header.reason != u16::from(LP2P_REACH_UNKNOWN)
+                    {
+                        verdict = Some(event.header.reason);
+                    }
+                }
+            }
+            let (text, code) = match verdict {
+                Some(r) if r == u16::from(LP2P_REACH_PUBLIC) => ("public", 0),
+                Some(_) => ("private", 1),
+                None => ("unknown", 2),
+            };
+            say(
+                &role,
+                format!("RESULT impl=rust transport={transport} reachability={text}"),
+            );
+            unsafe { lp2p_shutdown(node.handle) };
+            std::process::exit(code);
+        }
         _ => {
-            let node = start(dialer_seed, dialer_group, LP2P_REACH_PRIVATE, &transport);
+            let node = start(dialer_seed, dialer_group, LP2P_REACH_PRIVATE, &transport, false);
             node.add_address(&relay_key, &relay_address);
             let listener_key = key_of(listener_seed);
             let circuit = format!("{relay_address}/p2p/{}/p2p-circuit", peer_id(&relay_key));
@@ -247,7 +297,10 @@ fn main() {
                 }
             }
             if !answered {
-                say(&role, format!("RESULT transport={transport} rpc=failed"));
+                say(
+                    &role,
+                    format!("RESULT impl=rust transport={transport} rpc=failed"),
+                );
                 std::process::exit(2);
             }
 
@@ -279,7 +332,7 @@ fn main() {
             say(
                 &role,
                 format!(
-                    "RESULT transport={transport} rpc=ok first_connection_relayed={relayed_first} {outcome}"
+                    "RESULT impl=rust transport={transport} rpc=ok first_connection_relayed={relayed_first} {outcome}"
                 ),
             );
             unsafe { lp2p_shutdown(node.handle) };

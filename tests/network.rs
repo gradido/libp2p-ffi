@@ -724,3 +724,251 @@ fn autonat_decides_for_a_node_configured_unknown() {
         node.shutdown();
     }
 }
+
+impl TestNode {
+    fn subscribe(&self, topic: &lp2p_key) -> i32 {
+        unsafe { lp2p_topic_subscribe(self.handle, topic.as_ptr()) }
+    }
+
+    fn unsubscribe(&self, topic: &lp2p_key) -> i32 {
+        unsafe { lp2p_topic_unsubscribe(self.handle, topic.as_ptr()) }
+    }
+
+    fn publish(&self, topic: &lp2p_key, payload: &[u8]) -> i32 {
+        unsafe { lp2p_topic_publish(self.handle, topic.as_ptr(), payload.as_ptr(), payload.len()) }
+    }
+
+    fn topic_peers(&self, topic: &lp2p_key) -> i32 {
+        unsafe { lp2p_topic_peers(self.handle, topic.as_ptr()) }
+    }
+
+    /// The topic messages that arrive within @p within.
+    fn messages(&self, within: Duration) -> Vec<Event> {
+        let deadline = Instant::now() + within;
+        let mut out = Vec::new();
+        while Instant::now() < deadline {
+            for event in self.poll(100) {
+                if event.header.r#type == LP2P_EV_TOPIC_MESSAGE {
+                    out.push(event);
+                }
+            }
+        }
+        out
+    }
+
+    fn stats(&self) -> lp2p_stats {
+        let mut stats = lp2p_stats {
+            size: std::mem::size_of::<lp2p_stats>() as u32,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { lp2p_stats_get(self.handle, &mut stats) }, LP2P_OK);
+        stats
+    }
+
+    /// Waits until the topic has a mesh peer, so that a publication reaches somebody.
+    fn await_topic_peers(&self, topic: &lp2p_key, timeout: Duration) -> i32 {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let peers = self.topic_peers(topic);
+            if peers > 0 || Instant::now() >= deadline {
+                return peers;
+            }
+            // Polling keeps the queue from filling while the mesh forms.
+            let _ = self.poll(200);
+        }
+    }
+}
+
+/// A topic key is 32 bytes of the caller's choosing; these two stand for two shards.
+const TOPIC: lp2p_key = [0x5a; 32];
+const OTHER_TOPIC: lp2p_key = [0x5b; 32];
+
+#[test]
+fn a_topic_carries_messages_between_nodes_that_cannot_dial_each_other() {
+    // Neither sender listens, so nothing they say can travel on a connection between them: what
+    // arrives went through the hub, which forwards because it follows the topic too.
+    let hub = start([80; 32], [0x80; 32]).unwrap();
+    let a = start_as(
+        [81; 32],
+        [0x81; 32],
+        Setup {
+            listen: false,
+            ..Setup::default()
+        },
+    )
+    .unwrap();
+    let b = start_as(
+        [82; 32],
+        [0x82; 32],
+        Setup {
+            listen: false,
+            ..Setup::default()
+        },
+    )
+    .unwrap();
+    let hub_address = hub.listen_address();
+    for node in [&a, &b] {
+        node.add_address(&hub, &hub_address);
+        node.bootstrap();
+    }
+    for node in [&hub, &a, &b] {
+        assert_eq!(node.subscribe(&TOPIC), LP2P_OK);
+    }
+    assert!(a.await_topic_peers(&TOPIC, Duration::from_secs(15)) > 0);
+
+    assert_eq!(a.publish(&TOPIC, b"block 1"), LP2P_OK);
+    let heard = b.wait_for(Duration::from_secs(15), |e| {
+        e.header.r#type == LP2P_EV_TOPIC_MESSAGE
+    });
+    assert_eq!(&heard.data[..32], &TOPIC[..], "the topic key comes first");
+    assert_eq!(&heard.data[32..], b"block 1");
+    assert_eq!(heard.header.node, a.key);
+    assert_eq!(heard.header.group, a.group);
+    // The hub follows the topic as well, so it both reported and forwarded the message.
+    hub.wait_for(Duration::from_secs(5), |e| {
+        e.header.r#type == LP2P_EV_TOPIC_MESSAGE && e.data[32..] == *b"block 1"
+    });
+    assert!(a.messages(Duration::from_millis(300)).is_empty(), "heard itself");
+
+    // A topic nobody subscribed to reaches nobody, and neither does one that was left.
+    assert_eq!(a.publish(&OTHER_TOPIC, b"nowhere"), LP2P_OK);
+    assert!(b.messages(Duration::from_secs(2)).is_empty());
+    assert_eq!(b.unsubscribe(&TOPIC), LP2P_OK);
+    thread::sleep(Duration::from_secs(2));
+    assert_eq!(a.publish(&TOPIC, b"block 2"), LP2P_OK);
+    assert!(b.messages(Duration::from_secs(3)).is_empty());
+    hub.wait_for(Duration::from_secs(10), |e| {
+        e.header.r#type == LP2P_EV_TOPIC_MESSAGE && e.data[32..] == *b"block 2"
+    });
+
+    let stats = a.stats();
+    assert_eq!(stats.topics_subscribed, 1);
+    // Two publications went out; the one into the topic a does not follow was dropped.
+    assert_eq!(stats.topic_out, 2);
+    assert!(stats.topic_bytes_out > 2 * LP2P_DELEGATION_BYTES as u64);
+    assert_eq!(b.stats().topics_subscribed, 0);
+    assert!(hub.stats().topic_in >= 2);
+
+    // A message above the caller's bound is refused where it is published.
+    assert_eq!(
+        a.publish(&TOPIC, &[0u8; (64 << 10) + 1]),
+        LP2P_ERR_INVALID_ARGUMENT
+    );
+
+    hub.shutdown();
+    a.shutdown();
+    b.shutdown();
+}
+
+#[test]
+fn members_of_a_topic_find_each_other_through_the_dht() {
+    // The two members never hear of each other from anyone: the bootstrap node does not follow
+    // the topic, so it neither forwards the message nor is part of the mesh. They only have the
+    // provider records under the topic key to go by.
+    let seed_node = start([85; 32], [0x85; 32]).unwrap();
+    let a = start([86; 32], [0x86; 32]).unwrap();
+    let b = start([87; 32], [0x87; 32]).unwrap();
+    let seed_address = seed_node.listen_address();
+    let _ = a.listen_address();
+    let _ = b.listen_address();
+    for node in [&a, &b] {
+        node.add_address(&seed_node, &seed_address);
+        node.bootstrap();
+    }
+    assert_eq!(a.subscribe(&TOPIC), LP2P_OK);
+    // Far enough apart that a's provider record is in the DHT before b looks it up, and close
+    // enough that b's first lookup, not its repeat, is what finds it.
+    thread::sleep(Duration::from_secs(2));
+    assert_eq!(b.subscribe(&TOPIC), LP2P_OK);
+
+    assert!(
+        b.await_topic_peers(&TOPIC, Duration::from_secs(30)) > 0,
+        "the topic lookup did not bring the two members together"
+    );
+    assert_eq!(b.publish(&TOPIC, b"found you"), LP2P_OK);
+    let heard = a.wait_for(Duration::from_secs(15), |e| {
+        e.header.r#type == LP2P_EV_TOPIC_MESSAGE
+    });
+    assert_eq!(&heard.data[32..], b"found you");
+    assert!(
+        seed_node.messages(Duration::from_millis(300)).is_empty(),
+        "a node that does not follow the topic reported a message from it"
+    );
+
+    seed_node.shutdown();
+    a.shutdown();
+    b.shutdown();
+}
+
+#[test]
+fn a_byte_limit_stops_topic_traffic_a_node_cannot_carry() {
+    let hub = start([90; 32], [0x90; 32]).unwrap();
+    let speaker = start([91; 32], [0x91; 32]).unwrap();
+    let hub_address = hub.listen_address();
+    speaker.add_address(&hub, &hub_address);
+    speaker.bootstrap();
+    for node in [&hub, &speaker] {
+        assert_eq!(node.subscribe(&TOPIC), LP2P_OK);
+    }
+    assert!(speaker.await_topic_peers(&TOPIC, Duration::from_secs(15)) > 0);
+
+    // A frame of a 256-byte payload is 393 bytes on the wire: the version byte and the 136-byte
+    // delegation on top. 400 a second with 500 in reserve lets one through and stops the next.
+    assert_eq!(
+        unsafe {
+            lp2p_limit_set_bytes(
+                hub.handle,
+                LP2P_CLASS_UNKNOWN,
+                LP2P_SCOPE_PEER,
+                LP2P_PROTOCOL_TOPICS,
+                lp2p_rate {
+                    amount: 400,
+                    interval_ms: 1000,
+                    burst: 500,
+                },
+            )
+        },
+        LP2P_OK
+    );
+    assert_eq!(speaker.publish(&TOPIC, &[1u8; 256]), LP2P_OK);
+    hub.wait_for(Duration::from_secs(10), |e| {
+        e.header.r#type == LP2P_EV_TOPIC_MESSAGE
+    });
+    assert_eq!(speaker.publish(&TOPIC, &[2u8; 256]), LP2P_OK);
+    let limited = hub.wait_for(Duration::from_secs(10), |e| e.header.r#type == LP2P_EV_LIMITED);
+    assert_eq!(limited.header.protocol, LP2P_PROTOCOL_TOPICS);
+    assert_eq!(limited.header.reason, LP2P_SCOPE_PEER as u16);
+    assert_eq!(limited.header.group, speaker.group);
+    assert!(hub.messages(Duration::from_secs(1)).is_empty());
+    let stats = hub.stats();
+    assert_eq!(stats.topic_in, 1);
+    assert_eq!(stats.topic_limited, 1);
+
+    // Room again after the bucket refilled.
+    thread::sleep(Duration::from_secs(2));
+    assert_eq!(speaker.publish(&TOPIC, &[3u8; 256]), LP2P_OK);
+    hub.wait_for(Duration::from_secs(10), |e| {
+        e.header.r#type == LP2P_EV_TOPIC_MESSAGE && e.data[32] == 3
+    });
+
+    // A protocol index that names neither an RPC nor topics is refused.
+    assert_eq!(
+        unsafe {
+            lp2p_limit_set_bytes(
+                hub.handle,
+                LP2P_CLASS_UNKNOWN,
+                LP2P_SCOPE_PEER,
+                RPC_PROTOCOLS.len() as u16,
+                lp2p_rate {
+                    amount: 1,
+                    interval_ms: 1000,
+                    burst: 1,
+                },
+            )
+        },
+        LP2P_ERR_INVALID_ARGUMENT
+    );
+
+    hub.shutdown();
+    speaker.shutdown();
+}

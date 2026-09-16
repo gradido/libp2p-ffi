@@ -104,6 +104,14 @@ fn rust_and_c_agree_on_every_layout() {
             "offsetof.lp2p_options.reachability",
             offset_of!(lp2p_options, reachability),
         ),
+        (
+            "offsetof.lp2p_options.topic_max_message_bytes",
+            offset_of!(lp2p_options, topic_max_message_bytes),
+        ),
+        (
+            "offsetof.lp2p_options.topic_max_subscriptions",
+            offset_of!(lp2p_options, topic_max_subscriptions),
+        ),
         ("sizeof.lp2p_event", size_of::<lp2p_event>()),
         ("offsetof.lp2p_event.id", offset_of!(lp2p_event, id)),
         ("offsetof.lp2p_event.group", offset_of!(lp2p_event, group)),
@@ -116,10 +124,20 @@ fn rust_and_c_agree_on_every_layout() {
             "offsetof.lp2p_stats.events_dropped",
             offset_of!(lp2p_stats, events_dropped),
         ),
+        (
+            "offsetof.lp2p_stats.topics_subscribed",
+            offset_of!(lp2p_stats, topics_subscribed),
+        ),
+        (
+            "offsetof.lp2p_stats.topic_limited",
+            offset_of!(lp2p_stats, topic_limited),
+        ),
         ("value.LP2P_DELEGATION_BYTES", LP2P_DELEGATION_BYTES),
         ("value.LP2P_CLASS_BLOCKED", LP2P_CLASS_BLOCKED as usize),
         ("value.LP2P_LIMITED_BLOCKED", LP2P_LIMITED_BLOCKED as usize),
         ("value.LP2P_PROTOCOL_ANY", LP2P_PROTOCOL_ANY as usize),
+        ("value.LP2P_PROTOCOL_TOPICS", LP2P_PROTOCOL_TOPICS as usize),
+        ("value.LP2P_EV_TOPIC_MESSAGE", LP2P_EV_TOPIC_MESSAGE as usize),
         ("value.LP2P_ABI_VERSION", LP2P_ABI_VERSION as usize),
     ];
     assert_eq!(

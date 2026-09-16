@@ -31,6 +31,8 @@ int main(void)
     OFF(lp2p_options, announce);
     OFF(lp2p_options, event_queue_bytes);
     OFF(lp2p_options, reachability);
+    OFF(lp2p_options, topic_max_message_bytes);
+    OFF(lp2p_options, topic_max_subscriptions);
     SIZE(lp2p_event);
     OFF(lp2p_event, id);
     OFF(lp2p_event, group);
@@ -40,10 +42,14 @@ int main(void)
     SIZE(lp2p_stats);
     OFF(lp2p_stats, rpc_in);
     OFF(lp2p_stats, events_dropped);
+    OFF(lp2p_stats, topics_subscribed);
+    OFF(lp2p_stats, topic_limited);
     printf("value.LP2P_DELEGATION_BYTES %d\n", LP2P_DELEGATION_BYTES);
     printf("value.LP2P_CLASS_BLOCKED %d\n", LP2P_CLASS_BLOCKED);
     printf("value.LP2P_LIMITED_BLOCKED %d\n", LP2P_LIMITED_BLOCKED);
     printf("value.LP2P_PROTOCOL_ANY %d\n", LP2P_PROTOCOL_ANY);
+    printf("value.LP2P_PROTOCOL_TOPICS %d\n", LP2P_PROTOCOL_TOPICS);
+    printf("value.LP2P_EV_TOPIC_MESSAGE %d\n", LP2P_EV_TOPIC_MESSAGE);
     printf("value.LP2P_ABI_VERSION %d\n", LP2P_ABI_VERSION);
     return 0;
 }

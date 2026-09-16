@@ -4,4 +4,7 @@ set -eu
 if [ -n "${GATEWAY:-}" ]; then
     ip route replace default via "$GATEWAY"
 fi
-exec /usr/local/bin/holepunch
+case "${IMPL:-rust}" in
+    js) exec /usr/local/bin/holepunch-js ;;
+    *) exec /usr/local/bin/holepunch ;;
+esac

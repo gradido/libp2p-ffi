@@ -32,11 +32,19 @@ const MAX_BUCKETS: usize = 1 << 16;
 const EVENTS_PER_SECOND: u32 = 10;
 
 /// What identifies a limit: a second limit for the same class, scope and protocol replaces it.
+/// What a limit counts: one token per request, or one per byte.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum Unit {
+    Messages,
+    Bytes,
+}
+
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct RuleId {
     class: u8,
     scope: u8,
     protocol: u16,
+    unit: Unit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -112,12 +120,13 @@ impl Limits {
     }
 
     /// Sets, replaces or -- with any zero field in @p rate -- removes the limit for this class,
-    /// scope and protocol.
-    pub fn set_limit(&mut self, class: u8, scope: u8, protocol: u16, rate: lp2p_rate) {
+    /// scope, protocol and unit. A limit in bytes and one in messages can hold at the same time.
+    pub fn set_limit(&mut self, class: u8, scope: u8, protocol: u16, unit: Unit, rate: lp2p_rate) {
         let id = RuleId {
             class,
             scope,
             protocol,
+            unit,
         };
         self.rules.retain(|r| r.id != id);
         if rate.amount != 0 && rate.interval_ms != 0 && rate.burst != 0 {
@@ -128,9 +137,9 @@ impl Limits {
         }
     }
 
-    /// Admits the request, or answers the reason it is refused: LP2P_LIMITED_BLOCKED, or the
-    /// scope of the first limit that had no token left.
-    pub fn check(&mut self, request: &Request, now: Instant) -> Result<(), u16> {
+    /// Admits a request or a published message of @p bytes, or answers the reason it is refused:
+    /// LP2P_LIMITED_BLOCKED, or the scope of the first limit that had no token left.
+    pub fn check(&mut self, request: &Request, bytes: usize, now: Instant) -> Result<(), u16> {
         let class = self.class_of(request.group);
         if class == LP2P_CLASS_BLOCKED {
             return Err(LP2P_LIMITED_BLOCKED);
@@ -151,6 +160,10 @@ impl Limits {
                 Some((*r, key))
             })
             .collect();
+        let cost = |rule: &Rule| match rule.id.unit {
+            Unit::Messages => 1.0,
+            Unit::Bytes => bytes as f64,
+        };
         // Checked before anything is taken, so a request refused by one limit does not use up
         // the tokens of the others.
         for (rule, key) in &matching {
@@ -159,13 +172,14 @@ impl Limits {
                 updated: now,
             });
             refill(bucket, &rule.rate, now);
-            if bucket.tokens < 1.0 {
+            if bucket.tokens < cost(rule) {
                 return Err(rule.id.scope as u16);
             }
         }
         for (rule, key) in &matching {
+            let taken = cost(rule);
             if let Some(bucket) = self.buckets.get_mut(&(rule.id, *key)) {
-                bucket.tokens -= 1.0;
+                bucket.tokens -= taken;
             }
         }
         if self.buckets.len() > MAX_BUCKETS {
@@ -271,22 +285,26 @@ mod tests {
             LP2P_CLASS_UNKNOWN,
             LP2P_SCOPE_PEER,
             LP2P_PROTOCOL_ANY,
+            Unit::Messages,
             rate(1, 1000, 2),
         );
         let peer = PeerId::random();
         let start = Instant::now();
-        assert_eq!(limits.check(&request(peer, None, 0), start), Ok(()));
-        assert_eq!(limits.check(&request(peer, None, 1), start), Ok(()));
+        assert_eq!(limits.check(&request(peer, None, 0), 1, start), Ok(()));
+        assert_eq!(limits.check(&request(peer, None, 1), 1, start), Ok(()));
         assert_eq!(
-            limits.check(&request(peer, None, 0), start),
+            limits.check(&request(peer, None, 0), 1, start),
             Err(LP2P_SCOPE_PEER as u16)
         );
         // Another peer has a bucket of its own.
-        assert_eq!(limits.check(&request(PeerId::random(), None, 0), start), Ok(()));
+        assert_eq!(
+            limits.check(&request(PeerId::random(), None, 0), 1, start),
+            Ok(())
+        );
         // One token per second.
         let later = start + Duration::from_millis(1100);
-        assert_eq!(limits.check(&request(peer, None, 0), later), Ok(()));
-        assert!(limits.check(&request(peer, None, 0), later).is_err());
+        assert_eq!(limits.check(&request(peer, None, 0), 1, later), Ok(()));
+        assert!(limits.check(&request(peer, None, 0), 1, later).is_err());
     }
 
     #[test]
@@ -296,44 +314,45 @@ mod tests {
             LP2P_CLASS_UNKNOWN,
             LP2P_SCOPE_IP_PREFIX,
             LP2P_PROTOCOL_ANY,
+            Unit::Messages,
             rate(1, 60_000, 1),
         );
         let now = Instant::now();
         assert_eq!(
-            limits.check(&request(PeerId::random(), Some("10.0.0.1"), 0), now),
+            limits.check(&request(PeerId::random(), Some("10.0.0.1"), 0), 1, now),
             Ok(())
         );
         assert_eq!(
-            limits.check(&request(PeerId::random(), Some("10.0.0.200"), 0), now),
+            limits.check(&request(PeerId::random(), Some("10.0.0.200"), 0), 1, now),
             Err(LP2P_SCOPE_IP_PREFIX as u16)
         );
         assert_eq!(
-            limits.check(&request(PeerId::random(), Some("10.0.1.1"), 0), now),
+            limits.check(&request(PeerId::random(), Some("10.0.1.1"), 0), 1, now),
             Ok(())
         );
-        assert_eq!(limits.check(&request(PeerId::random(), None, 0), now), Ok(()));
+        assert_eq!(limits.check(&request(PeerId::random(), None, 0), 1, now), Ok(()));
     }
 
     #[test]
     fn classes_protocols_and_removal() {
         let mut limits = Limits::default();
-        limits.set_limit(7, LP2P_SCOPE_GLOBAL, 3, rate(1, 60_000, 1));
+        limits.set_limit(7, LP2P_SCOPE_GLOBAL, 3, Unit::Messages, rate(1, 60_000, 1));
         let peer = PeerId::random();
         let now = Instant::now();
         // The group is unknown, so class 7's limit does not apply.
-        assert_eq!(limits.check(&request(peer, None, 3), now), Ok(()));
-        assert_eq!(limits.check(&request(peer, None, 3), now), Ok(()));
+        assert_eq!(limits.check(&request(peer, None, 3), 1, now), Ok(()));
+        assert_eq!(limits.check(&request(peer, None, 3), 1, now), Ok(()));
         limits.set_class(GROUP, 7);
-        assert_eq!(limits.check(&request(peer, None, 3), now), Ok(()));
-        assert!(limits.check(&request(peer, None, 3), now).is_err());
+        assert_eq!(limits.check(&request(peer, None, 3), 1, now), Ok(()));
+        assert!(limits.check(&request(peer, None, 3), 1, now).is_err());
         // Another protocol is not limited.
-        assert_eq!(limits.check(&request(peer, None, 4), now), Ok(()));
+        assert_eq!(limits.check(&request(peer, None, 4), 1, now), Ok(()));
         // A zero rate removes the limit.
-        limits.set_limit(7, LP2P_SCOPE_GLOBAL, 3, rate(0, 0, 0));
-        assert_eq!(limits.check(&request(peer, None, 3), now), Ok(()));
+        limits.set_limit(7, LP2P_SCOPE_GLOBAL, 3, Unit::Messages, rate(0, 0, 0));
+        assert_eq!(limits.check(&request(peer, None, 3), 1, now), Ok(()));
         limits.set_class(GROUP, LP2P_CLASS_BLOCKED);
         assert_eq!(
-            limits.check(&request(peer, None, 4), now),
+            limits.check(&request(peer, None, 4), 1, now),
             Err(LP2P_LIMITED_BLOCKED)
         );
         limits.set_class(GROUP, LP2P_CLASS_UNKNOWN);
@@ -347,20 +366,22 @@ mod tests {
             LP2P_CLASS_UNKNOWN,
             LP2P_SCOPE_PEER,
             LP2P_PROTOCOL_ANY,
+            Unit::Messages,
             rate(1, 60_000, 5),
         );
         limits.set_limit(
             LP2P_CLASS_UNKNOWN,
             LP2P_SCOPE_GLOBAL,
             LP2P_PROTOCOL_ANY,
+            Unit::Messages,
             rate(1, 60_000, 1),
         );
         let peer = PeerId::random();
         let now = Instant::now();
-        assert_eq!(limits.check(&request(peer, None, 0), now), Ok(()));
+        assert_eq!(limits.check(&request(peer, None, 0), 1, now), Ok(()));
         for _ in 0..10 {
             assert_eq!(
-                limits.check(&request(peer, None, 0), now),
+                limits.check(&request(peer, None, 0), 1, now),
                 Err(LP2P_SCOPE_GLOBAL as u16)
             );
         }
@@ -369,12 +390,55 @@ mod tests {
             LP2P_CLASS_UNKNOWN,
             LP2P_SCOPE_GLOBAL,
             LP2P_PROTOCOL_ANY,
+            Unit::Messages,
             rate(0, 0, 0),
         );
         for _ in 0..4 {
-            assert_eq!(limits.check(&request(peer, None, 0), now), Ok(()));
+            assert_eq!(limits.check(&request(peer, None, 0), 1, now), Ok(()));
         }
-        assert!(limits.check(&request(peer, None, 0), now).is_err());
+        assert!(limits.check(&request(peer, None, 0), 1, now).is_err());
+    }
+
+    #[test]
+    fn a_limit_in_bytes_counts_the_size_and_holds_beside_one_in_messages() {
+        let mut limits = Limits::default();
+        limits.set_limit(
+            LP2P_CLASS_UNKNOWN,
+            LP2P_SCOPE_PEER,
+            LP2P_PROTOCOL_TOPICS,
+            Unit::Bytes,
+            rate(1000, 1000, 4000),
+        );
+        limits.set_limit(
+            LP2P_CLASS_UNKNOWN,
+            LP2P_SCOPE_PEER,
+            LP2P_PROTOCOL_TOPICS,
+            Unit::Messages,
+            rate(1, 1000, 3),
+        );
+        let peer = PeerId::random();
+        let now = Instant::now();
+        // Three messages of 1000 bytes fit both limits; the fourth has bytes left but no message.
+        for _ in 0..3 {
+            assert_eq!(
+                limits.check(&request(peer, None, LP2P_PROTOCOL_TOPICS), 1000, now),
+                Ok(())
+            );
+        }
+        assert_eq!(
+            limits.check(&request(peer, None, LP2P_PROTOCOL_TOPICS), 1, now),
+            Err(LP2P_SCOPE_PEER as u16)
+        );
+        // A second later there is one message again, but 2500 bytes is over what refilled.
+        let later = now + Duration::from_secs(1);
+        assert_eq!(
+            limits.check(&request(peer, None, LP2P_PROTOCOL_TOPICS), 2500, later),
+            Err(LP2P_SCOPE_PEER as u16)
+        );
+        assert_eq!(
+            limits.check(&request(peer, None, LP2P_PROTOCOL_TOPICS), 900, later),
+            Ok(())
+        );
     }
 
     #[test]
@@ -395,10 +459,11 @@ mod tests {
             LP2P_CLASS_UNKNOWN,
             LP2P_SCOPE_PEER,
             LP2P_PROTOCOL_ANY,
+            Unit::Messages,
             rate(1, 1000, 1),
         );
         let now = Instant::now();
-        limits.check(&request(PeerId::random(), None, 0), now).unwrap();
+        limits.check(&request(PeerId::random(), None, 0), 1, now).unwrap();
         assert_eq!(limits.buckets.len(), 1);
         limits.sweep(now + Duration::from_secs(2));
         assert!(limits.buckets.is_empty());

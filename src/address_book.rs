@@ -46,6 +46,10 @@ impl AddressBook {
         self.order.push_back(peer);
     }
 
+    pub fn addresses(&self, peer: &PeerId) -> &[Multiaddr] {
+        self.addresses.get(peer).map_or(&[], Vec::as_slice)
+    }
+
     pub fn knows(&self, peer: &PeerId) -> bool {
         self.addresses.contains_key(peer)
     }

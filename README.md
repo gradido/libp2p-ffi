@@ -26,12 +26,15 @@ community and a node one of its instances.
 | delegation checked on every request and response | done |
 | TCP + Noise + Yamux, QUIC | done |
 | circuit relay v2: a PRIVATE node reserves on up to two relays and announces only relayed addresses; a node that is not PRIVATE relays for others, with every libp2p limit configurable | done |
-| DCUtR: a relayed connection is upgraded by hole punching, reported as `LP2P_EV_HOLE_PUNCH` | done — verified through NAT in Docker (`interop/holepunch`): TCP and QUIC upgrade through cone NAT, and stay relayed through symmetric NAT |
+| DCUtR: a relayed connection is upgraded by hole punching, reported as `LP2P_EV_HOLE_PUNCH` | done — verified through NAT in Docker (`interop/holepunch`): TCP and QUIC upgrade through cone NAT, and stay relayed through symmetric NAT. With js-libp2p nodes it does not upgrade; see below |
 | connection limits: total, per peer, pending incoming | done |
 | AutoNAT: a node configured UNKNOWN is moved to PUBLIC or PRIVATE by dial-back probes, and reserves on relays when it turns out private | done — verified on loopback with `--features test-loopback`; the move back from PRIVATE to PUBLIC is implemented but not tested |
 | peer classes per group, blocked groups, token-bucket limits per class, scope (peer, IP prefix, global) and protocol | done — checked once a request and its delegation have arrived |
 | announcement over gossipsub: signed, published on change, delegation checked before it is reported or forwarded, blocked groups dropped, at most one per ten seconds per node (three in reserve) | done |
-| interop test against js-libp2p | not yet |
+| topics: subscribe, publish, `lp2p_topic_peers`, and a mesh bootstrapped over the DHT -- providing the topic key on subscribe, looking it up, dialing a few members, and repeating while a topic has no peer | done -- gossipsub never dials to fill a mesh, so a topic with a handful of members needs this to work at all |
+| byte-rate limits beside the message rates, per class, scope and protocol, with `LP2P_PROTOCOL_TOPICS` for published messages | done -- the two hold at once; whichever runs out first stops the message |
+| provider records under any key the caller chooses: `lp2p_dht_provide`, `lp2p_dht_stop_providing`, `lp2p_dht_find_providers` | done |
+| interop with js-libp2p under Bun: RPC, announcements, topics, DHT lookups and relay in both directions, QUIC, and `bun build --compile` | done — `interop/js`; DCUtR and AutoNAT across the two in `interop/holepunch`, with the limits of js-libp2p written down below |
 
 ## Layout
 
@@ -49,10 +52,14 @@ scripts/localize.sh    release build -> dist/<target>/libp2p_ffi.o, .h, SHA256SU
 scripts/c-smoke.sh     links tests/c/smoke.c against that object with cc and zig cc
 examples/holepunch.rs  one node of the NAT test, by ROLE
 interop/holepunch/     two nodes behind NAT routers and a relay, in Docker
+examples/interop_peer.rs  a node driven over stdin, the counterpart for tests in other languages
+interop/js/            js-libp2p under Bun against this module
 tests/abi_layout.rs    the C compiler's layout of the header against the Rust one
 tests/network.rs       nodes on loopback, driven through the C interface: group calls with
                        failover, a private node reached through a relay, with and without DCUtR,
-                       limits per class and a blocked group, announcements
+                       limits per class and a blocked group, announcements, topics through a
+                       node the publisher cannot dial, and two members that find each other
+                       through nothing but the DHT
 ```
 
 ## Build and test
@@ -61,6 +68,7 @@ tests/network.rs       nodes on loopback, driven through the C interface: group 
 cargo test                  # unit tests, ABI layout (needs a C compiler), network on loopback
 cargo test --features test-loopback   # also AutoNAT, which needs loopback addresses accepted
 interop/holepunch/run.sh              # hole punching through NAT, in Docker, no root needed
+interop/js/run.sh                     # js-libp2p under Bun against this module
 scripts/localize.sh         # dist/host/libp2p_ffi.o
 scripts/c-smoke.sh          # the shipped object, linked from C and run
 ```
@@ -68,38 +76,76 @@ scripts/c-smoke.sh          # the shipped object, linked from C and run
 The toolchain is pinned in `rust-toolchain.toml`, and libp2p to an exact version in `Cargo.toml`:
 a libp2p upgrade is a deliberate release, not a lockfile update.
 
-## Hole punching through NAT
+## NAT: hole punching and AutoNAT, Rust and js-libp2p
 
-Loopback has no NAT, so hole punching cannot be tested there. `interop/holepunch` builds one:
+Loopback has no NAT, so neither hole punching nor AutoNAT can be tested there. `interop/holepunch`
+builds one:
 
 ```text
-lan-a 10.99.1.0/24          public 10.99.0.0/24          lan-b 10.99.2.0/24
+lan-a 10.99.1.0/24          public 11.99.0.0/24          lan-b 10.99.2.0/24
 dialer .10 -- router-a .2 | .11 -- relay .10 -- .12 | .2 router-b -- .10 listener
+client-nat .20 -/            client-public .13
 ```
 
 The routers are Debian containers with `iptables`: MASQUERADE for cone NAT, `--random-fully` for
 symmetric NAT, nothing forwarded in that the LAN did not ask for, and unsolicited packets to the
-router dropped rather than answered. All networks are internal, so nothing leaves the host.
-`run.sh` builds the `holepunch` example on the host (the images are bookworm-slim plus that binary,
-no Rust image), runs every transport against every NAT and prints one line each:
+router dropped rather than answered. The "public" network uses 11.99.0.0/24 because js-libp2p's
+DCUtR and AutoNAT, and rust-libp2p's AutoNAT, ignore private addresses by design; all networks are
+internal, so nothing leaves the host whatever the range. Every role can be played by the Rust
+`holepunch` example or by `interop/js/holepunch-node.ts` compiled with Bun -- same seeds, same peer
+ids, same RESULT line.
 
-```text
-tcp   cone      exit 0  as-expected transport=tcp rpc=ok first_connection_relayed=true hole_punch=direct ...
-tcp   symmetric exit 1  as-expected transport=tcp rpc=ok first_connection_relayed=true hole_punch=none
-quic  cone      exit 0  as-expected transport=quic rpc=ok first_connection_relayed=true hole_punch=direct ...
-quic  symmetric exit 1  as-expected transport=quic rpc=ok first_connection_relayed=true hole_punch=none
+```sh
+interop/holepunch/run.sh                                  # everything below
+interop/holepunch/run.sh holepunch rust-js quic cone      # one hole-punching combination
+interop/holepunch/run.sh autonat js-rust tcp              # one AutoNAT combination
 ```
 
-`run.sh quic cone` runs one combination, `VERBOSE=1` prints every container's log, and
-`LP2P_TRACE="libp2p_dcutr=debug"` adds libp2p's own tracing to the nodes. It works with rootless
-Docker; the routers need `NET_ADMIN`, which Docker grants inside the container without root on the
-host.
+`VERBOSE=1` prints every container's log, `LP2P_TRACE="libp2p_dcutr=debug"` adds rust-libp2p's
+tracing. Every line says `as-expected` or `UNEXPECTED`, and the expectations in `run.sh` carry the
+reason for every combination that is expected to fail. It runs on rootless Docker; the routers need
+`NET_ADMIN`, which Docker grants inside the container without root on the host.
 
-Two things this test found in the module, both fixed: a node listening on `0.0.0.0` dialed before
-it knew its interface addresses, so the first connections left from random ports and peers punched
-towards mappings that did not lead back -- `lp2p_start` now waits for them; and a router that
-answers an early SYN with a reset kills the punch, which is why the test routers drop it, as real
-ones do.
+### Hole punching (dialer-listener, relay always Rust)
+
+```text
+                 cone NAT        symmetric NAT
+rust-rust tcp    direct          relayed
+rust-rust quic   direct          relayed
+any pair with js relayed         relayed     -- js offers no addresses, see below
+```
+
+The call gets its answer in every combination; what differs is whether the connection is upgraded.
+
+**js-libp2p does not hole punch from behind NAT.** Its DCUtR offers the peer only addresses its
+AutoNAT has verified, and behind NAT AutoNAT verifies none: the dial-back is exactly what the NAT
+drops. With `TRUST_OBSERVED=1` the js nodes confirm their observed addresses themselves, as
+rust-libp2p offers them, and one combination gets through -- a js dialer to a Rust listener over QUIC.
+The others still cannot: js-libp2p's QUIC dials each connection from a new UDP socket, so the port a
+peer observed is not the one it could punch to, and its TCP cannot reuse the listen port for a dial.
+
+### AutoNAT (client-server)
+
+```text
+                      client public         client behind NAT
+rust client, rust     public                private
+js client, rust       address verified      unverified   -- js has no private verdict
+any client, js server no verdict           no verdict   -- js server bug, see below
+```
+
+A Rust server answers both implementations. **js-libp2p's AutoNAT server answers nobody:** it dials
+back with `openConnection` without `force`, which returns the client's existing connection; the
+address check then fails and its `finally` closes that connection, request stream and all. The
+client sees an unexpected end of file. And js-libp2p's client has no private verdict at all: an
+observed address is verified after 4 successful dial-backs or dropped after 8 failed ones, each from a
+different /8 network.
+
+### What the tests found in the module
+
+Fixed: a node listening on `0.0.0.0` dialed before it knew its interface addresses, so the first
+connections left from random ports and peers punched towards mappings that did not lead back --
+`lp2p_start` now waits for them. And a router that answers an early SYN with a reset kills the
+punch, which is why the test routers drop it, as real ones do.
 
 ## What ships: a localized object
 
@@ -136,13 +182,19 @@ delegation node key (32) | group key (32) | expires_ms, big endian (8, 0 = never
              "libp2p-ffi delegation v1" || node key || group key || expires_ms
 ```
 
-Every node announces itself as a Kademlia provider under its group key (the raw 32 bytes). A
-stream closed without a response is a rejection.
+Every node announces itself as a Kademlia provider under `0x12 0x20 || sha256(group key)` -- the
+multihash of `CIDv1(raw, sha2-256(group key))`, because js-libp2p's DHT names keys by CID only. A
+stream closed without a response is a rejection. Every node runs `/ipfs/ping/1.0.0`: a js-libp2p DHT
+pings a peer before it adds it to its routing table.
 
 ```text
 announcement   u8 1 | delegation (136) | payload
                as the data of a gossipsub message the node signs (strict validation), on the
                topic "<dht_protocol>/announce" unless the caller names another
+topic message  the same frame, on "/lp2p/topic/1/" + the 32-byte topic key in lowercase hex
+               reported with the topic key in front of the payload; the topic key is also
+               provided in the DHT under 0x12 0x20 || sha256(topic key), which is how the
+               members of a small topic find each other
 ```
 
 ## License

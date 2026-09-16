@@ -14,6 +14,7 @@ use libp2p::{Multiaddr, StreamProtocol};
 use crate::abi::*;
 use crate::delegation::{Delegation, now_ms};
 use crate::keys;
+use crate::limits::Unit;
 use crate::node::{AnnounceConfig, Command, Config, Node, Reachability, RelayConfig, TokenBucket};
 
 /// The handle C holds.
@@ -185,6 +186,8 @@ unsafe fn config_from(o: &lp2p_options) -> Result<Config, i32> {
         announce,
         // Below one megabyte-sized response a queue would drop the first large event it meets.
         event_queue_bytes: o.event_queue_bytes.max(o.rpc_max_response_bytes as usize + 4096),
+        topic_max_message_bytes: o.topic_max_message_bytes as usize,
+        topic_max_subscriptions: o.topic_max_subscriptions as usize,
     })
 }
 
@@ -380,23 +383,46 @@ pub unsafe extern "C" fn lp2p_limit_set(
     protocol: u16,
     rate: lp2p_rate,
 ) -> i32 {
-    guard(|| {
-        status((|| {
-            let node = unsafe { handle(node)? };
-            if scope > LP2P_SCOPE_GLOBAL
-                || peer_class == LP2P_CLASS_BLOCKED
-                || (protocol != LP2P_PROTOCOL_ANY && protocol as usize >= node.rpc_protocol_count)
-            {
-                return Err(LP2P_ERR_INVALID_ARGUMENT);
-            }
-            Ok(node.send(Command::SetLimit {
-                class: peer_class,
-                scope,
-                protocol,
-                rate,
-            }))
-        })())
-    })
+    guard(|| unsafe { set_limit(node, peer_class, scope, protocol, Unit::Messages, rate) })
+}
+
+/// # Safety
+/// `node` is a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lp2p_limit_set_bytes(
+    node: *mut lp2p,
+    peer_class: u8,
+    scope: u8,
+    protocol: u16,
+    rate: lp2p_rate,
+) -> i32 {
+    guard(|| unsafe { set_limit(node, peer_class, scope, protocol, Unit::Bytes, rate) })
+}
+
+unsafe fn set_limit(
+    node: *mut lp2p,
+    peer_class: u8,
+    scope: u8,
+    protocol: u16,
+    unit: Unit,
+    rate: lp2p_rate,
+) -> i32 {
+    status((|| {
+        let node = unsafe { handle(node)? };
+        let named = protocol == LP2P_PROTOCOL_ANY
+            || protocol == LP2P_PROTOCOL_TOPICS
+            || (protocol as usize) < node.rpc_protocol_count;
+        if scope > LP2P_SCOPE_GLOBAL || peer_class == LP2P_CLASS_BLOCKED || !named {
+            return Err(LP2P_ERR_INVALID_ARGUMENT);
+        }
+        Ok(node.send(Command::SetLimit {
+            class: peer_class,
+            scope,
+            protocol,
+            unit,
+            rate,
+        }))
+    })())
 }
 
 /// # Safety
@@ -414,6 +440,124 @@ pub unsafe extern "C" fn lp2p_announce_set_payload(node: *mut lp2p, data: *const
                 return Err(LP2P_ERR_INVALID_ARGUMENT);
             }
             Ok(node.send(Command::AnnounceSetPayload { payload }))
+        })())
+    })
+}
+
+/// # Safety
+/// `node` is a live handle and `topic_key` 32 readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lp2p_topic_subscribe(node: *mut lp2p, topic_key: *const u8) -> i32 {
+    guard(|| {
+        status((|| {
+            let node = unsafe { handle(node)? };
+            let key = unsafe { key(topic_key)? };
+            if node.shared.topics_subscribed.load(Ordering::Relaxed) as usize >= node.topic_max_subscriptions
+            {
+                return Ok(LP2P_ERR_LIMITED);
+            }
+            Ok(node.send(Command::TopicSubscribe { key }))
+        })())
+    })
+}
+
+/// # Safety
+/// `node` is a live handle and `topic_key` 32 readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lp2p_topic_unsubscribe(node: *mut lp2p, topic_key: *const u8) -> i32 {
+    guard(|| {
+        status((|| {
+            let node = unsafe { handle(node)? };
+            let key = unsafe { key(topic_key)? };
+            Ok(node.send(Command::TopicUnsubscribe { key }))
+        })())
+    })
+}
+
+/// # Safety
+/// `node` is a live handle, `topic_key` 32 readable bytes and `data` holds `len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lp2p_topic_publish(
+    node: *mut lp2p,
+    topic_key: *const u8,
+    data: *const u8,
+    len: usize,
+) -> i32 {
+    guard(|| {
+        status((|| {
+            let node = unsafe { handle(node)? };
+            let key = unsafe { key(topic_key)? };
+            let payload = unsafe { bytes(data, len)? };
+            if payload.len() > node.topic_max_message_bytes {
+                return Err(LP2P_ERR_INVALID_ARGUMENT);
+            }
+            Ok(node.send(Command::TopicPublish {
+                key,
+                payload: payload.to_vec(),
+            }))
+        })())
+    })
+}
+
+/// # Safety
+/// `node` is a live handle and `topic_key` 32 readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lp2p_topic_peers(node: *const lp2p, topic_key: *const u8) -> i32 {
+    guard(|| {
+        status((|| {
+            let node = unsafe { handle(node)? };
+            let key = unsafe { key(topic_key)? };
+            let (reply, answer) = std::sync::mpsc::channel();
+            let sent = node.send(Command::TopicPeers { key, reply });
+            if sent != LP2P_OK {
+                return Ok(sent);
+            }
+            let count = answer
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|_| LP2P_ERR_SHUT_DOWN)?;
+            Ok(count.min(i32::MAX as usize) as i32)
+        })())
+    })
+}
+
+/// # Safety
+/// `node` is a live handle and `record_key` 32 readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lp2p_dht_provide(node: *mut lp2p, record_key: *const u8) -> i32 {
+    guard(|| {
+        status((|| {
+            let node = unsafe { handle(node)? };
+            let key = unsafe { key(record_key)? };
+            Ok(node.send(Command::Provide { key, stop: false }))
+        })())
+    })
+}
+
+/// # Safety
+/// `node` is a live handle and `record_key` 32 readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lp2p_dht_stop_providing(node: *mut lp2p, record_key: *const u8) -> i32 {
+    guard(|| {
+        status((|| {
+            let node = unsafe { handle(node)? };
+            let key = unsafe { key(record_key)? };
+            Ok(node.send(Command::Provide { key, stop: true }))
+        })())
+    })
+}
+
+/// # Safety
+/// `node` is a live handle, `record_key` 32 readable bytes and `query_id` writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lp2p_dht_find_providers(
+    node: *mut lp2p,
+    record_key: *const u8,
+    query_id: *mut u64,
+) -> i32 {
+    guard(|| {
+        status((|| {
+            let key = unsafe { key(record_key)? };
+            Ok(unsafe { query(node, query_id, |id| Command::FindProviders { id, key }) })
         })())
     })
 }
@@ -533,11 +677,16 @@ pub unsafe extern "C" fn lp2p_stats_get(node: *const lp2p, out: *mut lp2p_stats)
                 size: size as u32,
                 connections: shared.connections.load(Ordering::Relaxed),
                 routing_table_peers: shared.routing_table_peers.load(Ordering::Relaxed),
-                reserved: 0,
+                topics_subscribed: shared.topics_subscribed.load(Ordering::Relaxed),
                 rpc_in: shared.rpc_in.load(Ordering::Relaxed),
                 rpc_out: shared.rpc_out.load(Ordering::Relaxed),
                 rpc_limited: shared.rpc_limited.load(Ordering::Relaxed),
                 events_dropped: shared.events.dropped(),
+                topic_in: shared.topic_in.load(Ordering::Relaxed),
+                topic_out: shared.topic_out.load(Ordering::Relaxed),
+                topic_bytes_in: shared.topic_bytes_in.load(Ordering::Relaxed),
+                topic_bytes_out: shared.topic_bytes_out.load(Ordering::Relaxed),
+                topic_limited: shared.topic_limited.load(Ordering::Relaxed),
             };
             let known = size.min(std::mem::size_of::<lp2p_stats>());
             // SAFETY: the caller's struct holds `size` bytes, `known` of which this module fills.

@@ -1,7 +1,8 @@
-# A node of the hole-punching test: the holepunch example, built on the host by run.sh.
-# bookworm, because the host that builds it is; the binary links against its glibc.
+# A node of the NAT tests: the holepunch example (Rust) and holepunch-node.ts compiled with Bun
+# (js), both built on the host by run.sh. IMPL picks one. bookworm, because the host that builds
+# them is; both link against its glibc.
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends iproute2 && rm -rf /var/lib/apt/lists/*
-COPY bin/holepunch /usr/local/bin/holepunch
+COPY bin/holepunch bin/holepunch-js /usr/local/bin/
 COPY node.sh /usr/local/bin/node.sh
 ENTRYPOINT ["/usr/local/bin/node.sh"]

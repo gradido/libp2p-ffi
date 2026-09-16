@@ -21,7 +21,7 @@ use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::{ConnectionId, NetworkBehaviour, SwarmEvent};
 use libp2p::{
     Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, autonat, connection_limits, dcutr, gossipsub,
-    identify, noise, relay, tcp, yamux,
+    identify, noise, ping, relay, tcp, yamux,
 };
 use tokio::sync::mpsc;
 
@@ -53,6 +53,13 @@ const MAX_RELAY_CANDIDATES: usize = 64;
 /// Announcements per source: one every ten seconds, three in reserve.
 const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(10);
 const ANNOUNCE_BURST: u32 = 3;
+/// How often a topic without a single mesh peer looks its members up in the DHT again. A topic
+/// only a handful of nodes follow is not found by gossipsub's own gossip -- nothing dials for a
+/// mesh -- so the DHT is what brings its members together.
+const TOPIC_LOOKUP_INTERVAL: Duration = Duration::from_secs(30);
+/// How many providers of a topic are dialed per lookup. Above gossipsub's mesh_n of six, dialing
+/// more only wastes connections: the mesh keeps six and prunes the rest.
+const TOPIC_DIALS: usize = 6;
 /// What a gossipsub message adds around an announcement frame: protobuf fields, the source, its
 /// sequence number, the topic and the signature with the node's public key.
 const GOSSIPSUB_OVERHEAD: usize = 1024;
@@ -110,6 +117,8 @@ pub struct Config {
     pub max_pending_incoming: Option<u32>,
     pub announce: Option<AnnounceConfig>,
     pub event_queue_bytes: usize,
+    pub topic_max_message_bytes: usize,
+    pub topic_max_subscriptions: usize,
 }
 
 pub enum Command {
@@ -149,7 +158,30 @@ pub enum Command {
         class: u8,
         scope: u8,
         protocol: u16,
+        unit: limits::Unit,
         rate: lp2p_rate,
+    },
+    TopicSubscribe {
+        key: lp2p_key,
+    },
+    TopicUnsubscribe {
+        key: lp2p_key,
+    },
+    TopicPublish {
+        key: lp2p_key,
+        payload: Vec<u8>,
+    },
+    TopicPeers {
+        key: lp2p_key,
+        reply: std::sync::mpsc::Sender<usize>,
+    },
+    Provide {
+        key: lp2p_key,
+        stop: bool,
+    },
+    FindProviders {
+        id: u64,
+        key: lp2p_key,
     },
     RoutingSample {
         max: usize,
@@ -167,6 +199,12 @@ pub struct Shared {
     pub rpc_in: AtomicU64,
     pub rpc_out: AtomicU64,
     pub rpc_limited: AtomicU64,
+    pub topics_subscribed: AtomicU32,
+    pub topic_in: AtomicU64,
+    pub topic_out: AtomicU64,
+    pub topic_bytes_in: AtomicU64,
+    pub topic_bytes_out: AtomicU64,
+    pub topic_limited: AtomicU64,
     pub poisoned: AtomicBool,
 }
 
@@ -179,6 +217,8 @@ pub struct Node {
     pub rpc_timeout: Duration,
     /// The payload bound, or None when announcements are off.
     pub announce_max_payload_bytes: Option<usize>,
+    pub topic_max_message_bytes: usize,
+    pub topic_max_subscriptions: usize,
 }
 
 impl Node {
@@ -200,12 +240,20 @@ impl Node {
             rpc_in: AtomicU64::new(0),
             rpc_out: AtomicU64::new(0),
             rpc_limited: AtomicU64::new(0),
+            topics_subscribed: AtomicU32::new(0),
+            topic_in: AtomicU64::new(0),
+            topic_out: AtomicU64::new(0),
+            topic_bytes_in: AtomicU64::new(0),
+            topic_bytes_out: AtomicU64::new(0),
+            topic_limited: AtomicU64::new(0),
             poisoned: AtomicBool::new(false),
         });
         let rpc_protocol_count = config.rpc_protocols.len();
         let rpc_max_request_bytes = config.rpc_max_request_bytes;
         let rpc_timeout = config.rpc_timeout;
         let announce_max_payload_bytes = config.announce.as_ref().map(|a| a.max_payload_bytes);
+        let topic_max_message_bytes = config.topic_max_message_bytes;
+        let topic_max_subscriptions = config.topic_max_subscriptions;
 
         let (commands, receiver) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -224,6 +272,8 @@ impl Node {
                 rpc_max_request_bytes,
                 rpc_timeout,
                 announce_max_payload_bytes,
+                topic_max_message_bytes,
+                topic_max_subscriptions,
             }),
             Ok(status) => {
                 let _ = thread.join();
@@ -334,12 +384,17 @@ struct Behaviour {
     address_book: AddressBook,
     kad: kad::Behaviour<MemoryStore>,
     identify: identify::Behaviour,
+    // js-libp2p's DHT pings a peer before it adds it to its routing table; a node without ping
+    // never gets into one.
+    ping: ping::Behaviour,
     rpc: request_response::Behaviour<RawCodec>,
     // Every node can dial through a relay; only a reachable one serves as one.
     relay_client: relay::client::Behaviour,
     relay_server: Toggle<relay::Behaviour>,
     dcutr: Toggle<dcutr::Behaviour>,
-    gossipsub: Toggle<gossipsub::Behaviour>,
+    // Always built, even with announcements off: a topic is subscribed to at runtime, and a node
+    // that carries no traffic of its own still forwards for the topics it follows.
+    gossipsub: gossipsub::Behaviour,
     autonat: Toggle<autonat::Behaviour>,
 }
 
@@ -357,18 +412,27 @@ fn autonat_config() -> autonat::Config {
 
 type BuildError = Box<dyn std::error::Error + Send + Sync>;
 
-fn make_gossipsub(announce: &AnnounceConfig, key: &Keypair) -> Result<gossipsub::Behaviour, BuildError> {
-    let config = gossipsub::ConfigBuilder::default()
+fn make_gossipsub(config: &Config, key: &Keypair) -> Result<gossipsub::Behaviour, BuildError> {
+    let largest = config
+        .announce
+        .as_ref()
+        .map_or(0, |a| a.max_payload_bytes)
+        .max(config.topic_max_message_bytes);
+    let gossipsub_config = gossipsub::ConfigBuilder::default()
         // Every message is signed by the node that published it, and nothing unsigned is taken.
         .validation_mode(gossipsub::ValidationMode::Strict)
         // Held back until the delegation inside has been checked: an invalid announcement is
         // neither reported nor forwarded.
         .validate_messages()
-        .max_transmit_size(1 + LP2P_DELEGATION_BYTES + announce.max_payload_bytes + GOSSIPSUB_OVERHEAD)
+        .max_transmit_size(1 + LP2P_DELEGATION_BYTES + largest + GOSSIPSUB_OVERHEAD)
         .build()?;
-    let mut behaviour =
-        gossipsub::Behaviour::new(gossipsub::MessageAuthenticity::Signed(key.clone()), config)?;
-    behaviour.subscribe(&gossipsub::IdentTopic::new(announce.topic.clone()))?;
+    let mut behaviour = gossipsub::Behaviour::new(
+        gossipsub::MessageAuthenticity::Signed(key.clone()),
+        gossipsub_config,
+    )?;
+    if let Some(announce) = &config.announce {
+        behaviour.subscribe(&gossipsub::IdentTopic::new(announce.topic.clone()))?;
+    }
     Ok(behaviour)
 }
 
@@ -433,20 +497,17 @@ fn make_behaviour(
     let relay_server = (config.relay.server && config.reachability != Reachability::Private)
         .then(|| relay::Behaviour::new(peer, relay_server_config(&config.relay)));
     let dcutr = config.dcutr.then(|| dcutr::Behaviour::new(peer));
-    let gossipsub = match &config.announce {
-        Some(announce) => Some(make_gossipsub(announce, key)?),
-        None => None,
-    };
     Ok(Behaviour {
         limits,
         address_book: AddressBook::default(),
         kad,
         identify,
+        ping: ping::Behaviour::default(),
         rpc,
         relay_client,
         relay_server: relay_server.into(),
         dcutr: dcutr.into(),
-        gossipsub: gossipsub.into(),
+        gossipsub: make_gossipsub(config, key)?,
         autonat: config
             .autonat
             .then(|| autonat::Behaviour::new(peer, autonat_config()))
@@ -552,6 +613,23 @@ struct State {
     announce_payload: Option<Vec<u8>>,
     announce_published: Option<Vec<u8>>,
     announce_rate: SourceRate,
+    /// The topics this node follows: the key the caller named them by, by gossipsub topic and the
+    /// other way round, and when each was last looked up in the DHT.
+    topics: HashMap<lp2p_key, TopicState>,
+    topic_keys: HashMap<gossipsub::TopicHash, lp2p_key>,
+    topic_lookups: HashMap<kad::QueryId, lp2p_key>,
+    topic_max_message_bytes: usize,
+    topic_max_subscriptions: usize,
+    /// Provider lookups the caller started, so their results reach it as discovered peers.
+    provider_queries: HashMap<kad::QueryId, u64>,
+    /// The IP each connected peer was seen on, for the prefix scope of a published message, whose
+    /// connection this node does not learn.
+    peer_ips: HashMap<PeerId, std::net::IpAddr>,
+}
+
+struct TopicState {
+    topic: gossipsub::IdentTopic,
+    last_lookup: Option<Instant>,
 }
 
 /// Queues @p peer for @p call: the group's last good node first, recently failed nodes last, the
@@ -599,6 +677,14 @@ fn without_peer(address: &Multiaddr) -> Multiaddr {
         .iter()
         .filter(|p| !matches!(p, Protocol::P2p(_)))
         .collect()
+}
+
+fn ip_of(address: &Multiaddr) -> Option<std::net::IpAddr> {
+    address.iter().find_map(|p| match p {
+        Protocol::Ip4(ip) => Some(std::net::IpAddr::V4(ip)),
+        Protocol::Ip6(ip) => Some(std::net::IpAddr::V6(ip)),
+        _ => None,
+    })
 }
 
 fn is_loopback(address: &Multiaddr) -> bool {
@@ -658,6 +744,13 @@ impl State {
             announce_payload: None,
             announce_published: None,
             announce_rate: SourceRate::new(ANNOUNCE_INTERVAL, ANNOUNCE_BURST),
+            topics: HashMap::new(),
+            topic_keys: HashMap::new(),
+            topic_lookups: HashMap::new(),
+            topic_max_message_bytes: config.topic_max_message_bytes,
+            topic_max_subscriptions: config.topic_max_subscriptions,
+            provider_queries: HashMap::new(),
+            peer_ips: HashMap::new(),
         }
     }
 
@@ -714,7 +807,7 @@ impl State {
         let _ = swarm
             .behaviour_mut()
             .kad
-            .start_providing(kad::RecordKey::new(&self.group));
+            .start_providing(kad::RecordKey::new(&wire::provider_key(&self.group)));
         self.provide_due = false;
         self.last_provide = Some(Instant::now());
     }
@@ -754,7 +847,7 @@ impl State {
                         let query = swarm
                             .behaviour_mut()
                             .kad
-                            .get_providers(kad::RecordKey::new(&group));
+                            .get_providers(kad::RecordKey::new(&wire::provider_key(&group)));
                         call.lookup_running = true;
                         self.provider_lookups.insert(query, id);
                     }
@@ -807,8 +900,37 @@ impl State {
                 class,
                 scope,
                 protocol,
+                unit,
                 rate,
-            } => self.limits.set_limit(class, scope, protocol, rate),
+            } => self.limits.set_limit(class, scope, protocol, unit, rate),
+            Command::TopicSubscribe { key } => self.topic_subscribe(swarm, key),
+            Command::TopicUnsubscribe { key } => self.topic_unsubscribe(swarm, key),
+            Command::TopicPublish { key, payload } => self.topic_publish(swarm, key, &payload),
+            Command::TopicPeers { key, reply } => {
+                let count = self.topics.get(&key).map_or(0, |state| {
+                    swarm
+                        .behaviour()
+                        .gossipsub
+                        .mesh_peers(&state.topic.hash())
+                        .count()
+                });
+                let _ = reply.send(count);
+            }
+            Command::Provide { key, stop } => {
+                let record = kad::RecordKey::new(&wire::provider_key(&key));
+                if stop {
+                    swarm.behaviour_mut().kad.stop_providing(&record);
+                } else {
+                    let _ = swarm.behaviour_mut().kad.start_providing(record);
+                }
+            }
+            Command::FindProviders { id, key } => {
+                let query = swarm
+                    .behaviour_mut()
+                    .kad
+                    .get_providers(kad::RecordKey::new(&wire::provider_key(&key)));
+                self.provider_queries.insert(query, id);
+            }
             Command::Shutdown => {}
         }
     }
@@ -878,6 +1000,25 @@ impl State {
         }
         self.reserve(swarm);
         self.announce(swarm);
+        let lonely: Vec<lp2p_key> = self
+            .topics
+            .iter()
+            .filter(|(_, state)| {
+                state
+                    .last_lookup
+                    .is_none_or(|t| now.duration_since(t) >= TOPIC_LOOKUP_INTERVAL)
+                    && swarm
+                        .behaviour()
+                        .gossipsub
+                        .mesh_peers(&state.topic.hash())
+                        .count()
+                        == 0
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        for key in lonely {
+            self.topic_lookup(swarm, key);
+        }
         if now.duration_since(self.last_sweep) >= Duration::from_secs(10) {
             self.limits.sweep(now);
             self.last_sweep = now;
@@ -949,11 +1090,8 @@ impl State {
         if self.announce_published.as_ref() == Some(payload) {
             return;
         }
-        let Some(gossipsub) = swarm.behaviour_mut().gossipsub.as_mut() else {
-            return;
-        };
         let frame = wire::encode_announcement(&self.delegation, payload);
-        match gossipsub.publish(topic.clone(), frame) {
+        match swarm.behaviour_mut().gossipsub.publish(topic.clone(), frame) {
             Ok(_) | Err(gossipsub::PublishError::Duplicate) => {
                 self.announce_published = Some(payload.clone());
             }
@@ -964,9 +1102,181 @@ impl State {
         }
     }
 
+    /// Follows a topic: the subscription itself, a provider record so that other members find
+    /// this node, and a first lookup of the members already there.
+    fn topic_subscribe(&mut self, swarm: &mut Swarm<Behaviour>, key: lp2p_key) {
+        if self.topics.contains_key(&key) || self.topics.len() >= self.topic_max_subscriptions {
+            return;
+        }
+        let topic = gossipsub::IdentTopic::new(wire::topic_name(&key));
+        if swarm.behaviour_mut().gossipsub.subscribe(&topic).is_err() {
+            return;
+        }
+        self.topic_keys.insert(topic.hash(), key);
+        self.topics.insert(
+            key,
+            TopicState {
+                topic,
+                last_lookup: None,
+            },
+        );
+        self.shared
+            .topics_subscribed
+            .store(self.topics.len() as u32, Ordering::Relaxed);
+        let _ = swarm
+            .behaviour_mut()
+            .kad
+            .start_providing(kad::RecordKey::new(&wire::provider_key(&key)));
+        self.topic_lookup(swarm, key);
+    }
+
+    fn topic_unsubscribe(&mut self, swarm: &mut Swarm<Behaviour>, key: lp2p_key) {
+        let Some(state) = self.topics.remove(&key) else {
+            return;
+        };
+        swarm.behaviour_mut().gossipsub.unsubscribe(&state.topic);
+        self.topic_keys.remove(&state.topic.hash());
+        swarm
+            .behaviour_mut()
+            .kad
+            .stop_providing(&kad::RecordKey::new(&wire::provider_key(&key)));
+        self.shared
+            .topics_subscribed
+            .store(self.topics.len() as u32, Ordering::Relaxed);
+    }
+
+    /// Asks the DHT who else follows this topic. Gossipsub never dials for a mesh of its own: two
+    /// nodes that follow the same topic but never meet would never exchange a message.
+    fn topic_lookup(&mut self, swarm: &mut Swarm<Behaviour>, key: lp2p_key) {
+        let query = swarm
+            .behaviour_mut()
+            .kad
+            .get_providers(kad::RecordKey::new(&wire::provider_key(&key)));
+        self.topic_lookups.insert(query, key);
+        if let Some(state) = self.topics.get_mut(&key) {
+            state.last_lookup = Some(Instant::now());
+        }
+    }
+
+    /// Dials a few members of a topic, so that gossipsub has connections to build its mesh on.
+    fn dial_topic_members(&mut self, swarm: &mut Swarm<Behaviour>, providers: &[PeerId]) {
+        let mut dialed = 0;
+        for peer in providers {
+            if dialed >= TOPIC_DIALS {
+                break;
+            }
+            if *peer == self.local_peer || swarm.is_connected(peer) {
+                continue;
+            }
+            // Without an address the dial fails at once; the next lookup tries again, by which
+            // time the peer is usually in the routing table with one.
+            if swarm.dial(*peer).is_ok() {
+                dialed += 1;
+            }
+        }
+    }
+
+    fn topic_publish(&mut self, swarm: &mut Swarm<Behaviour>, key: lp2p_key, payload: &[u8]) {
+        let Some(state) = self.topics.get(&key) else {
+            return;
+        };
+        let frame = wire::encode_announcement(&self.delegation, payload);
+        let size = frame.len() as u64;
+        if swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(state.topic.clone(), frame)
+            .is_ok()
+        {
+            self.shared.topic_out.fetch_add(1, Ordering::Relaxed);
+            self.shared.topic_bytes_out.fetch_add(size, Ordering::Relaxed);
+        }
+    }
+
+    /// A message on one of the followed topics: the same frame as an announcement, reported with
+    /// the topic key in front of the payload.
+    fn topic_message(
+        &mut self,
+        propagation_source: PeerId,
+        message: &gossipsub::Message,
+    ) -> gossipsub::MessageAcceptance {
+        let Some(&key) = self.topic_keys.get(&message.topic) else {
+            return gossipsub::MessageAcceptance::Ignore;
+        };
+        let now = Instant::now();
+        let checked = (|| {
+            let publisher = message.source?;
+            let node = keys::key_of(&publisher)?;
+            let frame = wire::decode_announcement(&message.data)?;
+            let delegation = Delegation::parse(frame.delegation).ok()?;
+            delegation.verify_for(&node, now_ms()).ok()?;
+            Some((node, delegation.group, frame.payload))
+        })();
+        let Some((node, group, payload)) = checked else {
+            return gossipsub::MessageAcceptance::Reject;
+        };
+        if payload.len() > self.topic_max_message_bytes {
+            return gossipsub::MessageAcceptance::Reject;
+        }
+        // The limit is counted against the peer that passed the message on -- that is who this
+        // node can stop -- while the class comes from the group that published it.
+        let admitted = self.limits.check(
+            &limits::Request {
+                group: &group,
+                peer: propagation_source,
+                ip: self.peer_ips.get(&propagation_source).copied(),
+                protocol: LP2P_PROTOCOL_TOPICS,
+            },
+            message.data.len(),
+            now,
+        );
+        if let Err(reason) = admitted {
+            self.shared.topic_limited.fetch_add(1, Ordering::Relaxed);
+            if self.limits.may_report(now) {
+                self.emit(
+                    EventBuilder::new(LP2P_EV_LIMITED)
+                        .group(group)
+                        .node(node)
+                        .protocol(LP2P_PROTOCOL_TOPICS)
+                        .reason(reason)
+                        .build(),
+                );
+            }
+            // Over a limit or from a blocked group: not forwarded, but not the fault of the peer
+            // that passed it on, so it is not held against them either.
+            return gossipsub::MessageAcceptance::Ignore;
+        }
+        self.shared.topic_in.fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .topic_bytes_in
+            .fetch_add(message.data.len() as u64, Ordering::Relaxed);
+        let mut data = Vec::with_capacity(key.len() + payload.len());
+        data.extend_from_slice(&key);
+        data.extend_from_slice(payload);
+        self.emit(
+            EventBuilder::new(LP2P_EV_TOPIC_MESSAGE)
+                .group(group)
+                .node(node)
+                .data(&data),
+        );
+        gossipsub::MessageAcceptance::Accept
+    }
+
     fn gossipsub_event(&mut self, swarm: &mut Swarm<Behaviour>, event: gossipsub::Event) {
         match event {
             gossipsub::Event::Subscribed { .. } => self.announce(swarm),
+            gossipsub::Event::Message {
+                propagation_source,
+                message_id,
+                message,
+            } if self.topic_keys.contains_key(&message.topic) => {
+                let acceptance = self.topic_message(propagation_source, &message);
+                swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                    &message_id,
+                    &propagation_source,
+                    acceptance,
+                );
+            }
             gossipsub::Event::Message {
                 propagation_source,
                 message_id,
@@ -1002,9 +1312,11 @@ impl State {
                         }
                     }
                 };
-                if let Some(gossipsub) = swarm.behaviour_mut().gossipsub.as_mut() {
-                    gossipsub.report_message_validation_result(&message_id, &propagation_source, acceptance);
-                }
+                swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                    &message_id,
+                    &propagation_source,
+                    acceptance,
+                );
             }
             _ => {}
         }
@@ -1180,6 +1492,11 @@ impl State {
                     libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr,
                 };
                 self.connections.insert(connection_id, remote.clone());
+                if !is_relayed(remote)
+                    && let Some(ip) = ip_of(remote)
+                {
+                    self.peer_ips.insert(peer_id, ip);
+                }
                 if endpoint.is_dialer() && !is_relayed(endpoint.get_remote_address()) {
                     self.dialed.insert(peer_id, endpoint.get_remote_address().clone());
                 }
@@ -1204,6 +1521,7 @@ impl State {
                 self.connections.remove(&connection_id);
                 if num_established == 0 {
                     self.dialed.remove(&peer_id);
+                    self.peer_ips.remove(&peer_id);
                     self.emit(
                         EventBuilder::new(LP2P_EV_PEER_DISCONNECTED)
                             .node(peer_key(&peer_id))
@@ -1266,6 +1584,34 @@ impl State {
                 ..
             } => match result {
                 kad::QueryResult::GetProviders(result) => {
+                    if self.topic_lookups.contains_key(&query) {
+                        if let Ok(kad::GetProvidersOk::FoundProviders { providers, .. }) = &result {
+                            let providers: Vec<PeerId> = providers.iter().copied().collect();
+                            self.dial_topic_members(swarm, &providers);
+                        }
+                        if step.last {
+                            self.topic_lookups.remove(&query);
+                        }
+                        return;
+                    }
+                    if let Some(&id) = self.provider_queries.get(&query) {
+                        if let Ok(kad::GetProvidersOk::FoundProviders { providers, .. }) = &result {
+                            for provider in providers {
+                                let addresses = swarm.behaviour().address_book.addresses(provider).to_vec();
+                                self.emit(discovered(id, provider, &addresses));
+                            }
+                        }
+                        if step.last {
+                            self.provider_queries.remove(&query);
+                            self.emit(
+                                EventBuilder::new(LP2P_EV_DHT_RESULT)
+                                    .id(id)
+                                    .flags(LP2P_EVF_LAST)
+                                    .build(),
+                            );
+                        }
+                        return;
+                    }
                     let Some(&call_id) = self.provider_lookups.get(&query) else {
                         return;
                     };
@@ -1413,13 +1759,7 @@ impl State {
             .connections
             .get(&connection)
             .filter(|address| !is_relayed(address))
-            .and_then(|address| {
-                address.iter().find_map(|p| match p {
-                    Protocol::Ip4(ip) => Some(std::net::IpAddr::V4(ip)),
-                    Protocol::Ip6(ip) => Some(std::net::IpAddr::V6(ip)),
-                    _ => None,
-                })
-            });
+            .and_then(ip_of);
         let now = Instant::now();
         let admitted = self.limits.check(
             &limits::Request {
@@ -1428,6 +1768,7 @@ impl State {
                 ip,
                 protocol: protocol as u16,
             },
+            frame.len(),
             now,
         );
         if let Err(reason) = admitted {

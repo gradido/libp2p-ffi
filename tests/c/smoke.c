@@ -134,6 +134,22 @@ int main(void)
         result = drain(b, buf_b, check, &expect);
     }
 
+    /* The topic calls, so that the shipped object is checked for their symbols too. A topic with
+     * one node has no peers; what matters here is that every call is accepted. */
+    {
+        lp2p_key topic;
+        uint64_t query = 0;
+        memset(topic, 0x5a, sizeof(topic));
+        if (lp2p_topic_subscribe(a, topic) != LP2P_OK ||
+            lp2p_topic_publish(a, topic, (const uint8_t *)"x", 1) != LP2P_OK ||
+            lp2p_topic_peers(a, topic) < 0 || lp2p_topic_unsubscribe(a, topic) != LP2P_OK ||
+            lp2p_dht_provide(a, topic) != LP2P_OK || lp2p_dht_find_providers(a, topic, &query) !=
+            LP2P_OK || lp2p_dht_stop_providing(a, topic) != LP2P_OK) {
+            fprintf(stderr, "a topic call was refused\n");
+            result = 0;
+        }
+    }
+
     (void)lp2p_shutdown(a);
     (void)lp2p_shutdown(b);
     if (result != 1) {

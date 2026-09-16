@@ -33,7 +33,32 @@ use libp2p::request_response;
 use crate::abi::LP2P_DELEGATION_BYTES;
 
 pub const RPC_PROTOCOL: StreamProtocol = StreamProtocol::new("/lp2p/rpc/1");
+
+/// The Kademlia key every node of a group provides under: the sha2-256 multihash of the group key,
+/// `0x12 0x20 || sha256(group key)`.
+///
+/// Not the raw 32 bytes: js-libp2p's DHT provides and looks up only by CID, whose key is a
+/// multihash. A CIDv1 with the raw codec over this digest names the same key there.
+pub fn provider_key(group: &[u8; 32]) -> Vec<u8> {
+    use sha2::Digest;
+    let mut key = Vec::with_capacity(34);
+    key.extend_from_slice(&[0x12, 0x20]);
+    key.extend_from_slice(&sha2::Sha256::digest(group));
+    key
+}
 const VERSION: u8 = 1;
+
+/// The gossipsub topic a 32-byte topic key names: `/lp2p/topic/1/<key in lowercase hex>`, hashed
+/// by identity, so the string itself is what travels. A mirror in another language builds the same
+/// string from the same key.
+pub fn topic_name(key: &[u8; 32]) -> String {
+    let mut name = String::with_capacity(14 + 64);
+    name.push_str("/lp2p/topic/1/");
+    for byte in key {
+        name.push_str(&format!("{byte:02x}"));
+    }
+    name
+}
 
 pub struct Request<'a> {
     pub delegation: &'a [u8],
@@ -179,6 +204,25 @@ mod tests {
         let frame = encode_response(&delegation, b"");
         let res = decode_response(&frame).unwrap();
         assert_eq!(res.payload, b"");
+    }
+
+    #[test]
+    fn the_provider_key_is_the_multihash_js_libp2p_names_by_cid() {
+        // CID.createV1(0x55, sha256.digest(32 bytes of 1)).multihash.bytes, from interop/js.
+        let expected = "122072cd6e8422c407fb6d098690f1130b7ded7ec2f7f5e1d30bd9d521f015363793";
+        let key: String = provider_key(&[1; 32])
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(key, expected);
+    }
+
+    #[test]
+    fn a_topic_key_names_one_string() {
+        assert_eq!(
+            topic_name(&[0xab; 32]),
+            "/lp2p/topic/1/abababababababababababababababababababababababababababababababab"
+        );
     }
 
     #[test]

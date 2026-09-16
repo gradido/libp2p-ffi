@@ -78,6 +78,8 @@ pub struct lp2p_options {
     pub announce: lp2p_announce_options,
     pub event_queue_bytes: usize,
     pub reachability: u8,
+    pub topic_max_message_bytes: u32,
+    pub topic_max_subscriptions: u32,
 }
 
 pub const LP2P_EV_LISTENING: u16 = 1;
@@ -93,6 +95,7 @@ pub const LP2P_EV_DHT_RESULT: u16 = 10;
 pub const LP2P_EV_LIMITED: u16 = 11;
 pub const LP2P_EV_OVERFLOW: u16 = 12;
 pub const LP2P_EV_HOLE_PUNCH: u16 = 13;
+pub const LP2P_EV_TOPIC_MESSAGE: u16 = 14;
 
 pub const LP2P_EVF_LAST: u16 = 1;
 
@@ -125,6 +128,8 @@ const _: () = assert!(LP2P_EVENT_HEADER_BYTES == 88);
 pub const LP2P_CLASS_UNKNOWN: u8 = 0;
 pub const LP2P_CLASS_BLOCKED: u8 = 255;
 pub const LP2P_PROTOCOL_ANY: u16 = 0xffff;
+/// The protocol a limit names to apply to published messages rather than to an RPC.
+pub const LP2P_PROTOCOL_TOPICS: u16 = 0xfffe;
 /// The reason an LP2P_EV_LIMITED carries when the class is LP2P_CLASS_BLOCKED rather than a scope.
 pub const LP2P_LIMITED_BLOCKED: u16 = 255;
 
@@ -138,11 +143,16 @@ pub struct lp2p_stats {
     pub size: u32,
     pub connections: u32,
     pub routing_table_peers: u32,
-    pub reserved: u32,
+    pub topics_subscribed: u32,
     pub rpc_in: u64,
     pub rpc_out: u64,
     pub rpc_limited: u64,
     pub events_dropped: u64,
+    pub topic_in: u64,
+    pub topic_out: u64,
+    pub topic_bytes_in: u64,
+    pub topic_bytes_out: u64,
+    pub topic_limited: u64,
 }
 
 /// The defaults `lp2p_options_default` hands out. The relay values are rust-libp2p's own.
@@ -195,5 +205,7 @@ pub fn default_options() -> lp2p_options {
         },
         event_queue_bytes: 1 << 20,
         reachability: LP2P_REACH_UNKNOWN,
+        topic_max_message_bytes: 64 << 10,
+        topic_max_subscriptions: 256,
     }
 }
