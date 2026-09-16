@@ -1,2 +1,4 @@
 /target
 /dist
+/interop/js/node_modules
+/interop/js/dist
