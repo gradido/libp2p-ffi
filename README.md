@@ -224,7 +224,9 @@ x86_64-apple-darwin         aarch64-apple-darwin          libp2p_ffi.o
 x86_64-pc-windows-msvc      aarch64-pc-windows-msvc       libp2p_ffi.lib
 
 each archive holds  the object, libp2p_ffi.h, NATIVE_LIBS.txt (what the caller's link line
-                    needs, printed by rustc rather than written down), SHA256SUMS
+                    needs, printed by rustc rather than written down), SHA256SUMS, and on
+                    Windows the one import library that comes from a crate rather than from
+                    the SDK -- put the archive's directory on the library search path there
 the release holds   the archives and one SHA256SUMS over them
 ```
 

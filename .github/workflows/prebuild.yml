@@ -75,15 +75,21 @@ jobs:
       # One platform failing must not hide what the others would have said.
       fail-fast: false
       matrix:
-        # Native runners for all six: a Rust build for macOS needs the Apple SDK and one for
-        # Windows the MSVC toolchain, so cross-compiling from Linux is not the cheaper road. The
-        # arm64 runners (ubuntu-22.04-arm, windows-11-arm) are free for public repositories; on a
-        # private one they are billed, and dropping those two rows leaves x64 working.
+        # A Rust build for macOS needs the Apple SDK and one for Windows the MSVC toolchain, so
+        # those four rows run on their own operating system. The arm64 runners (ubuntu-22.04-arm,
+        # windows-11-arm) are free for public repositories; on a private one they are billed, and
+        # dropping those two rows leaves x64 working.
+        #
+        # Both macOS artifacts are built on the arm64 runner. The Intel one is cross-compiled
+        # rather than built on macos-13, which GitHub has retired: a job asking for that label
+        # queues until it is cancelled instead of failing. One SDK builds for both architectures,
+        # and what cross means here is only that the smoke test links the object without running
+        # it -- this machine cannot execute it.
         include:
           - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
           - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
-          - { os: macos-13, target: x86_64-apple-darwin }
           - { os: macos-14, target: aarch64-apple-darwin }
+          - { os: macos-14, target: x86_64-apple-darwin, cross: true }
           - { os: windows-2022, target: x86_64-pc-windows-msvc, arch: x64 }
           - { os: windows-11-arm, target: aarch64-pc-windows-msvc, arch: arm64 }
     runs-on: ${{ matrix.os }}
@@ -97,24 +103,33 @@ jobs:
           ref: ${{ needs.gate.outputs.sha }}
       # rust-toolchain.toml pins the compiler; this installs exactly that one.
       - run: rustup show
+      - name: the target, when it is not this machine's
+        if: matrix.cross
+        run: rustup target add ${{ matrix.target }}
       - name: unit tests
         run: cargo test --lib --release
       - name: the whole suite, where the network tests are at home
         if: startsWith(matrix.os, 'ubuntu')
         run: cargo test --features test-loopback
       - name: build the prebuild
-        run: scripts/localize.sh
+        run: scripts/localize.sh ${{ matrix.target }}
       - name: link it from C and run it
         if: runner.os != 'Windows'
-        run: scripts/c-smoke.sh
+        env:
+          # A cross-built object links here and runs nowhere on this machine.
+          SMOKE_LINK_ONLY: ${{ matrix.cross && '1' || '0' }}
+        run: scripts/c-smoke.sh ${{ matrix.target }}
       - name: link it from C and run it
         if: runner.os == 'Windows'
         shell: cmd
         run: |
           for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set VSPATH=%%i
           call "%VSPATH%\VC\Auxiliary\Build\vcvarsall.bat" ${{ matrix.arch }} || exit /b 1
-          set /p NATIVE_LIBS=<dist\host\NATIVE_LIBS.txt
-          cl /nologo /I dist\host tests\c\smoke.c dist\host\libp2p_ffi.lib %NATIVE_LIBS% /Fe:smoke.exe || exit /b 1
+          set /p NATIVE_LIBS=<dist\${{ matrix.target }}\NATIVE_LIBS.txt
+          rem What rustc printed is for the linker, not for the compiler -- /defaultlib: and the
+          rem import libraries go after /link. /LIBPATH points at the archive, which carries the
+          rem one import library that is not the linker's own.
+          cl /nologo /I dist\${{ matrix.target }} tests\c\smoke.c /Fe:smoke.exe /link /LIBPATH:dist\${{ matrix.target }} dist\${{ matrix.target }}\libp2p_ffi.lib %NATIVE_LIBS% || exit /b 1
           smoke.exe || exit /b 1
       - name: package
         env:
@@ -123,7 +138,7 @@ jobs:
         run: |
           set -eu
           name="libp2p-ffi-$VERSION-$TARGET"
-          mv dist/host "dist/$name"
+          mv "dist/$TARGET" "dist/$name"
           tar -czf "$name.tar.gz" -C dist "$name"
       - uses: actions/upload-artifact@v4
         with:

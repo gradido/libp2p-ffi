@@ -79,8 +79,17 @@ macho)
     lib="$base/liblibp2p_ffi.a"
     # ld64 takes the archive whole with -all_load, so the duplicate-member dance above is not
     # needed. -exported_symbols_list globs, and everything it does not name becomes private extern.
+    #
+    # -arch is not optional for a partial link, and the way it fails is not a message: without it
+    # ld reads the archive as "building for -unknown", ignores it, and then trips over an
+    # assertion of its own in the objc pass.
+    case "${target:-$(uname -m)}" in
+        x86_64*) arch=x86_64 ;;
+        aarch64* | arm64*) arch=arm64 ;;
+        *) echo "unknown macOS architecture: ${target:-$(uname -m)}" >&2; exit 1 ;;
+    esac
     echo '_lp2p_*' > "$work/api.txt"
-    ld -r -all_load "$lib" -exported_symbols_list "$work/api.txt" -o "$out/libp2p_ffi.o"
+    ld -r -arch "$arch" -all_load "$lib" -exported_symbols_list "$work/api.txt" -o "$out/libp2p_ffi.o"
     # -x drops the local symbols; the exported ones stay.
     strip -x "$out/libp2p_ffi.o"
     artifact=libp2p_ffi.o
@@ -90,6 +99,19 @@ macho)
 coff)
     cp "$base/libp2p_ffi.lib" "$out/libp2p_ffi.lib"
     artifact=libp2p_ffi.lib
+    # rustc names the libraries the object needs but not where it found them, and not all of them
+    # are Windows': the windows-targets crate ships its own import library, windows.0.52.0.lib,
+    # inside the registry. A caller with nothing but this archive cannot link without it, so
+    # whatever is not on the linker's own search path travels with the artifact.
+    for token in $(cat "$out/NATIVE_LIBS.txt"); do
+        case "$token" in *.lib) ;; *) continue ;; esac
+        [ -f "$out/$token" ] && continue
+        found=$(find "${CARGO_HOME:-$HOME/.cargo}/registry/src" -name "$token" 2> /dev/null | head -n 1)
+        if [ -n "$found" ]; then
+            cp "$found" "$out/$token"
+            echo "carried along: $token"
+        fi
+    done
     # No symbol table reader that is there on every Windows runner without the MSVC environment;
     # what proves this artifact is the smoke link in scripts/c-smoke.sh, which fails loudly.
     exported=0
@@ -103,6 +125,7 @@ if [ "$exported" -lt "$expected" ]; then
 fi
 
 cp "$root/include/libp2p_ffi.h" "$out/"
-(cd "$out" && sums "$artifact" libp2p_ffi.h NATIVE_LIBS.txt > SHA256SUMS)
+# Everything in the directory, whatever the platform put there.
+(cd "$out" && rm -f SHA256SUMS && set -- * && sums "$@" > SHA256SUMS)
 echo "$out/$artifact: $exported global symbols, $(du -h "$out/$artifact" | cut -f1)"
 echo "link with: $(cat "$out/NATIVE_LIBS.txt")"
