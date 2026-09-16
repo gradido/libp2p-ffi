@@ -54,11 +54,17 @@ jobs:
             echo "publish=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Fails the job when the title says release and the version does not back it up.
+          # Fails the job when the title says release and the version does not back it up. Not
+          # through a pipe: the exit status of a pipeline is the last command's, and a refused
+          # release would then pass as a skipped build instead of a red job.
           answer=$(scripts/release-version.sh check "$PR_TITLE" "$BASE_SHA")
-          echo "$answer"
+          # The verdict is the last line on stdout; notes and reasons went to stderr and are in
+          # the log above. Taking the last line rather than all of it means a line added to the
+          # script can never turn a release into a skipped build again.
+          answer=$(printf '%s\n' "$answer" | tail -n 1)
+          echo "verdict: $answer"
           case "$answer" in
-            release:*) echo "publish=true" >> "$GITHUB_OUTPUT" ;;
+            "release: "*) echo "publish=true" >> "$GITHUB_OUTPUT" ;;
             *) echo "publish=false" >> "$GITHUB_OUTPUT" ;;
           esac
 
