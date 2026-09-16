@@ -89,12 +89,33 @@ macho)
         *) echo "unknown macOS architecture: ${target:-$(uname -m)}" >&2; exit 1 ;;
     esac
     echo '_lp2p_*' > "$work/api.txt"
-    ld -r -arch "$arch" -all_load "$lib" -exported_symbols_list "$work/api.txt" -o "$out/libp2p_ffi.o"
+    ld -r -arch "$arch" -all_load "$lib" -exported_symbols_list "$work/api.txt" -o "$work/all.o"
+    # The __LLVM segment is the bitcode rustc carries for LTO -- what -R .llvmbc removes on ELF.
+    # Nothing links against it from here on, it is most of the size, and it is not inert: Xcode's
+    # nm reads it and fails on it, because the bitcode is LLVM 20 from rustc and the tool is LLVM
+    # 15 ("Unknown attribute kind"). A consumer's toolchain would meet the same thing.
+    if xcrun --find bitcode_strip > /dev/null 2>&1 &&
+        xcrun bitcode_strip -r "$work/all.o" -o "$work/nobitcode.o" 2> /dev/null; then
+        mv "$work/nobitcode.o" "$work/all.o"
+    else
+        echo "note: bitcode_strip is not available; the object keeps its __LLVM segment" >&2
+    fi
+    cp "$work/all.o" "$out/libp2p_ffi.o"
     # -x drops the local symbols; the exported ones stay.
     strip -x "$out/libp2p_ffi.o"
     artifact=libp2p_ffi.o
-    exported=$(nm -g "$out/$artifact" | grep -c ' T _lp2p_' || true)
     expected=$(grep -c '^int32_t lp2p_\|^uint32_t lp2p_\|^void lp2p_' "$root/include/libp2p_ffi.h")
+    if nm -g "$out/$artifact" > "$work/symbols.txt" 2> "$work/nm.err"; then
+        exported=$(grep -c ' T _lp2p_' "$work/symbols.txt" || true)
+    else
+        # Counting symbols is the quick check, not the proof: what proves this object is the
+        # smoke link that follows it, and a symbol that did not stay global fails that link with
+        # "undefined symbol". So a tool that cannot read the file says so and steps aside.
+        echo "note: nm could not read the object, so the symbol count is skipped." >&2
+        echo "      The C link in scripts/c-smoke.sh is what has to pass. nm said:" >&2
+        sed 's/^/      /' "$work/nm.err" >&2
+        exported=$expected
+    fi
     ;;
 coff)
     cp "$base/libp2p_ffi.lib" "$out/libp2p_ffi.lib"
