@@ -2,10 +2,13 @@
 # allowed to? The rule itself is scripts/release-version.sh, so this workflow and the one that
 # publishes cannot drift apart.
 #
-# A pull request whose title says "release" fails here unless the Cargo.toml version is higher
-# than the base branch's and higher than every tag. One that does not say it passes, with a note
-# when the version moved anyway -- a bump that publishes nothing is worth seeing before the merge,
-# not after.
+# A pull request whose title says "release" fails here unless the version can still be released:
+# not tagged yet, after every tag, and the same version the title names. One that does not say it
+# passes, with a note when the version moved anyway -- a bump that publishes nothing is worth
+# seeing before the merge, not after.
+#
+# Make this a required status check on the default branch ("release version"), or it stays a red
+# mark next to a green merge button.
 name: release gate
 
 on:
@@ -16,7 +19,9 @@ permissions:
   contents: read
 
 jobs:
-  version:
+  release-version:
+    # The name a branch protection rule asks for by hand: make it say what it guards.
+    name: release version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -7,10 +7,18 @@
 #   scripts/release-version.sh check <title> <base>    exits 0 when the pull request is
 #                                                      consistent, non-zero with a reason when not
 #
-# A release is a pull request whose title says "release" *and* whose Cargo.toml version is higher
-# than the base branch's and higher than every tag. Two conditions rather than one, because each
-# alone is a way to publish by accident: a title is written by hand, and a version bump that only
-# prepares the next round would publish on its own.
+# A release is a pull request whose title says "release" and whose Cargo.toml version has not been
+# released before. What is hard and what is a note:
+#
+#   hard   the title says release, so nothing publishes by accident -- a version bump that only
+#          prepares the next round stays unpublished
+#   hard   v<version> is not tagged yet, and comes after every tag: a released version is never
+#          rebuilt and the line never goes backwards
+#   hard   a version named in the title is the version in Cargo.toml -- "release v0.0.1" with
+#          0.1.0 in the file is a mistake, and it is the one that is easiest to make
+#   note   the version is the same as on the base branch. Allowed: the first release of a version
+#          that was written down long before it went out, and bumping in one pull request and
+#          releasing in another, are both ordinary. The tag rules above are what keep it honest.
 set -eu
 
 root=$(cd "$(dirname "$0")" && cd .. && pwd)
@@ -58,9 +66,11 @@ check)
         exit 0
     fi
 
-    if [ -n "$old" ] && ! higher "$new" "$old"; then
-        echo "the title says release, but $new is not higher than the base branch's $old." >&2
-        echo "Raise version in Cargo.toml, or take the word out of the title." >&2
+    # A version in the title -- "release v0.0.1", "Release 0.2.0" -- has to be the one that ships.
+    named=$(printf '%s' "$title" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || true)
+    if [ -n "$named" ] && [ "$named" != "$new" ]; then
+        echo "the title says v$named, Cargo.toml says $new." >&2
+        echo "Set version in Cargo.toml to $named, or name $new in the title." >&2
         exit 1
     fi
     if git -C "$root" rev-parse -q --verify "refs/tags/v$new" > /dev/null; then
@@ -71,6 +81,13 @@ check)
     if [ -n "$last" ] && ! higher "$new" "$last"; then
         echo "the highest released version is $last, and $new does not come after it." >&2
         exit 1
+    fi
+    if [ -n "$old" ] && [ "$old" = "$new" ]; then
+        echo "note: the version is unchanged on this branch. Nothing has been released under" \
+             "v$new, so this is its first release."
+    elif [ -n "$old" ] && higher "$old" "$new"; then
+        echo "note: the version moves back, $old -> $new. No tag stands in the way, so it goes" \
+             "out -- but check that this is what you meant."
     fi
     echo "release: v$new${old:+ (was $old)}"
     ;;

@@ -200,12 +200,17 @@ topic message  the same frame, on "/lp2p/topic/1/" + the 32-byte topic key in lo
 
 ## Releases
 
-A release is a pull request whose **title says "release"** and whose **`Cargo.toml` version is
-higher** than the base branch's and than every tag. Both conditions, because either alone
-publishes by accident: a title is typed by hand, and a version bump that only prepares the next
-round would release on its own. `scripts/release-version.sh` is the rule; `.github/workflows`
-runs it twice -- on the open pull request, so a missing bump is a red check rather than a
-surprise, and again at merge, because a title can be edited after a green one.
+A release is a pull request whose **title says "release"** and whose **`Cargo.toml` version has
+not been released before**: not tagged yet, after every tag, and -- when the title names a version
+-- the same one the file says. The title is what makes it deliberate; the tags are what make it
+safe. A version that is unchanged on the branch is fine and says so in the log: bumping in one
+pull request and releasing in another is ordinary, and a first release has nothing to bump from.
+
+`scripts/release-version.sh` is that rule, and `.github/workflows` runs it twice -- on the open
+pull request, so a mismatch is a red check rather than a surprise, and again at merge, because a
+title can be edited after a green one. **Make the check required on the default branch**
+(Settings -> Rules, require the status check named *release version*): without that, GitHub shows
+the red mark and lets the merge through anyway.
 
 What a merge then builds, on a native runner each, is one archive per target:
 
