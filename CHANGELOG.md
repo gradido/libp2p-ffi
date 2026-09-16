@@ -15,9 +15,11 @@ wire   what travels between nodes. A change here is a change every implementatio
 build  what the prebuild archive holds and what the caller's link line needs.
 ```
 
-## 0.1.1
+## 0.1.2
 
-The first published release. 0.1.0 was tagged by nobody and exists only in the history.
+The first published release. 0.1.0 and 0.1.1 were tagged by nobody: the pipeline that builds a
+release was still being taught its own platforms, and a version it could not build was left
+behind rather than reused.
 
 - **ABI** `LP2P_ABI_VERSION` 1. Node lifecycle, event polling, RPC to a group with failover,
   peer classes and token-bucket limits in messages and bytes, relay and reachability options,
@@ -32,3 +34,8 @@ The first published release. 0.1.0 was tagged by nobody and exists only in the h
 - **build** One archive per target: the object (`libp2p_ffi.o`; `libp2p_ffi.lib` on Windows, where
   MSVC has no partial link), `libp2p_ffi.h`, `NATIVE_LIBS.txt` with what the link line needs, and
   `SHA256SUMS`. Linux, macOS and Windows, x64 and arm64.
+  **On Windows the archive's own directory belongs on the library search path**
+  (`/LIBPATH:<archive>`): `NATIVE_LIBS.txt` names an import library that comes from a crate rather
+  than from the Windows SDK, and it travels in the archive.
+  The Intel macOS object is cross-built on an arm64 runner — GitHub has retired the Intel ones —
+  so it is linked but never executed before release; every other artifact runs its smoke test.
