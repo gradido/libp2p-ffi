@@ -88,7 +88,27 @@ macho)
         aarch64* | arm64*) arch=arm64 ;;
         *) echo "unknown macOS architecture: ${target:-$(uname -m)}" >&2; exit 1 ;;
     esac
-    echo '_lp2p_*' > "$work/api.txt"
+    # The LLVM tools of this very rustc: they know Mach-O, and they read its bitcode, which
+    # Xcode's own tools may be too old for. Asked from the repository, so rust-toolchain.toml
+    # picks the compiler rather than whatever the caller's shell defaults to.
+    tools="$(cd "$root" && rustc --print sysroot)/lib/rustlib/$(cd "$root" && rustc -vV | sed -n 's/^host: //p')/bin"
+    if [ ! -x "$tools/llvm-objcopy" ]; then
+        echo "llvm-objcopy not found in $tools -- rustup component add llvm-tools" >&2
+        exit 1
+    fi
+
+    # The one symbol that cannot be made local. compiler_builtins is never part of LTO, and its
+    # objects refer to _rust_eh_personality as an undefined external. On ELF, objcopy localizes
+    # after the partial link, when those references already point at the definition. On Mach-O
+    # the export list is applied inside ld -r, the definition becomes private extern, and the
+    # references stay behind unbound: "Undefined symbols: _rust_eh_personality" at the caller's
+    # link. Renaming it is not possible either -- llvm-objcopy leaves undefined Mach-O symbols
+    # alone. So it stays global, but weak: its references resolve as in any partial link, and a
+    # second Rust staticlib in the same binary brings its own personality without a duplicate
+    # symbol -- the linker keeps one of them.
+    "$tools/llvm-objcopy" --weaken-symbol _rust_eh_personality "$lib" "$work/weak.a"
+    lib="$work/weak.a"
+    printf '%s\n' '_lp2p_*' '_rust_eh_personality' > "$work/api.txt"
     # -platform_version only silences ld's "no platform load command found" in every build that
     # links this object later. Old linkers do not know the flag, so a refusal falls back rather
     # than failing the release over a warning.
@@ -117,8 +137,14 @@ macho)
     # what relocations need; Mach-O's strip has no such promise.
     artifact=libp2p_ffi.o
     expected=$(grep -c '^int32_t lp2p_\|^uint32_t lp2p_\|^void lp2p_' "$root/include/libp2p_ffi.h")
-    if nm -g "$out/$artifact" > "$work/symbols.txt" 2> "$work/nm.err"; then
+    if "$tools/llvm-nm" "$out/$artifact" > "$work/symbols.txt" 2> "$work/nm.err"; then
         exported=$(grep -c ' T _lp2p_' "$work/symbols.txt" || true)
+        # What the smoke link would find out a step later, said here with its reason.
+        if grep -q ' U _rust_eh_personality$' "$work/symbols.txt"; then
+            echo "the object still refers to _rust_eh_personality without binding it to its own" >&2
+            echo "definition; a caller's link would fail with an undefined symbol." >&2
+            exit 1
+        fi
     else
         # Counting symbols is the quick check, not the proof: what proves this object is the
         # smoke link that follows it, and a symbol that did not stay global fails that link with
