@@ -39,3 +39,7 @@ behind rather than reused.
   than from the Windows SDK, and it travels in the archive.
   The Intel macOS object is cross-built on an arm64 runner — GitHub has retired the Intel ones —
   so it is linked but never executed before release; every other artifact runs its smoke test.
+  **On macOS the object exports one symbol besides `lp2p_*`: `_rust_eh_personality`, weak.**
+  Rust's own `compiler_builtins` refers to it from outside the LTO unit, and a Mach-O partial
+  link cannot hide it without leaving those references unbound. Weak means a second Rust
+  staticlib in the same binary links without a duplicate symbol; the linker keeps one personality.

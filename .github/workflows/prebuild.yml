@@ -106,6 +106,12 @@ jobs:
       - name: the target, when it is not this machine's
         if: matrix.cross
         run: rustup target add ${{ matrix.target }}
+      # llvm-objcopy and llvm-nm of the pinned rustc: scripts/localize.sh weakens one symbol with
+      # them on Mach-O, which Apple's tools cannot do, and reads the object with an LLVM that
+      # understands the bitcode rustc wrote.
+      - name: LLVM tools of the pinned compiler
+        if: runner.os == 'macOS'
+        run: rustup component add llvm-tools
       - name: unit tests
         run: cargo test --lib --release
       - name: the whole suite, where the network tests are at home

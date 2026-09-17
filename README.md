@@ -234,7 +234,11 @@ Every job runs the unit tests, builds the artifact and links `tests/c/smoke.c` a
 anything is published; the Linux jobs run the whole suite. **Windows ships the staticlib**, not a
 localized object: MSVC's toolchain has no partial link. The clash that localization avoids is
 ELF's, so this is expected to be fine, and it is untested with a second Rust staticlib in one
-binary -- `scripts/localize.sh` says so at the point where it matters.
+binary -- `scripts/localize.sh` says so at the point where it matters. **macOS exports one symbol
+besides `lp2p_*`: `_rust_eh_personality`, as a weak definition.** `compiler_builtins`, which is
+never part of LTO, refers to it from outside, and ld64 applies an export list inside the partial
+link, where hiding the definition leaves those references unbound. Weak keeps a second Rust
+staticlib in the same binary linkable.
 
 ## License
 
