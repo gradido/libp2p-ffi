@@ -89,7 +89,15 @@ macho)
         *) echo "unknown macOS architecture: ${target:-$(uname -m)}" >&2; exit 1 ;;
     esac
     echo '_lp2p_*' > "$work/api.txt"
-    ld -r -arch "$arch" -all_load "$lib" -exported_symbols_list "$work/api.txt" -o "$work/all.o"
+    # -platform_version only silences ld's "no platform load command found" in every build that
+    # links this object later. Old linkers do not know the flag, so a refusal falls back rather
+    # than failing the release over a warning.
+    sdk=$(xcrun --show-sdk-version 2> /dev/null || echo 11.0)
+    ld -r -arch "$arch" -platform_version macos 11.0 "$sdk" -all_load "$lib" \
+        -exported_symbols_list "$work/api.txt" -o "$work/all.o" 2> "$work/ld.err" || {
+        cat "$work/ld.err" >&2
+        ld -r -arch "$arch" -all_load "$lib" -exported_symbols_list "$work/api.txt" -o "$work/all.o"
+    }
     # The __LLVM segment is the bitcode rustc carries for LTO -- what -R .llvmbc removes on ELF.
     # Nothing links against it from here on, it is most of the size, and it is not inert: Xcode's
     # nm reads it and fails on it, because the bitcode is LLVM 20 from rustc and the tool is LLVM
@@ -101,8 +109,12 @@ macho)
         echo "note: bitcode_strip is not available; the object keeps its __LLVM segment" >&2
     fi
     cp "$work/all.o" "$out/libp2p_ffi.o"
-    # -x drops the local symbols; the exported ones stay.
-    strip -x "$out/libp2p_ffi.o"
+    # No `strip -x` here, however tempting the size is. -exported_symbols_list has already made
+    # everything but the lp2p_ names private extern, which is what keeps two Rust staticlibs from
+    # colliding -- and private extern is *local*, so -x deletes it. Including
+    # _rust_eh_personality, which the unwind tables point at: the object then links with
+    # "Undefined symbols: _rust_eh_personality". ELF has objcopy --strip-unneeded, which keeps
+    # what relocations need; Mach-O's strip has no such promise.
     artifact=libp2p_ffi.o
     expected=$(grep -c '^int32_t lp2p_\|^uint32_t lp2p_\|^void lp2p_' "$root/include/libp2p_ffi.h")
     if nm -g "$out/$artifact" > "$work/symbols.txt" 2> "$work/nm.err"; then
